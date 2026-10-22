@@ -1,0 +1,547 @@
+# bpfrig: shared eBPF loading library — design
+
+Status: proposal, nothing implemented yet (2026-10-22). Based on a
+read-through of the five aya-based tools listed under "Consumers". Each
+inventory entry names the functions it would replace.
+
+## Why
+
+Each tool that loads eBPF has grown its own copy of the same plumbing: the
+BTF offset reader, bpffs and pin bookkeeping, the kprobe table and its
+attach loop, the `bpf` LSM checks, the stats map readers, and the
+`build.rs` that drives aya-build. Most of it was copied from the previous
+tool, and the copies have since drifted apart. A shared crate gives one
+place to fix a bug or add a feature and have it land in every tool, and
+it makes the next tool mostly policy rather than plumbing.
+
+## Consumers
+
+| Tool (repository) | BPF programs | Lifecycle | aya |
+|---|---|---|---|
+| edge-xdp-flood | XDP, TC egress classifier | resident process; map pins removed on exit | =0.13.1, moving to 0.14 |
+| deny-sctp (cve-2026-sctp) | `lsm/socket_create` or `cgroup/sock_create` | pin the link and exit | 0.14 |
+| unix-gc-guard (cve-2026-53361-af_unix_gc) | kprobes, `lsm/socket_recvmsg` | pin and exit, self-test | 0.14 |
+| vsock-zc-guard (cve-2026-53365-vsock-zerocopy) | kprobes, `lsm/socket_sendmsg`, `lsm/socket_create` | pin and exit, self-test | 0.14 |
+| btr-tripwire (cve-2026-64508-btr) | kprobes, kill-mode maps | pin and exit, self-test | 0.14 |
+
+The three guard tools (unix-gc, vsock, btr) share the most. They have the
+same CLI shape (`--load`, `--unload`, `--status`, `--stats`, `--check`) and
+the same pin-and-exit model. They also share the same self-test idea:
+drive the hooked operation once and require a counter to move. deny-sctp
+shares a subset. edge-xdp-flood is mostly its own datapath, policy and TUI
+code, but it has a few generic pieces.
+
+## Goals and non-goals
+
+Goals:
+
+- One copy of every piece of loading plumbing in the inventory below, with
+  the drift between the copies resolved (see "Drift the merge resolves").
+- CVE-specific and datapath-specific code stays in the tools.
+- Migrating a tool changes no user-visible behavior unless this document
+  says so.
+
+Non-goals:
+
+- A framework that owns `main()` or the CLI. Phase 2 considers a
+  load-sequence skeleton, but only after the helpers have settled.
+- Compatibility with aya 0.13.
+- Hiding aya. Tools keep using aya types directly; bpfrig fills the gaps.
+
+## Workspace layout
+
+```
+bpfrig-rs/
+  Cargo.toml        workspace
+  bpfrig/           userspace library (aya 0.14)
+  bpfrig-ebpf/      no_std helpers for the BPF side (aya-ebpf)
+  bpfrig-build/     build-dependency wrapping aya-build
+  doc/
+```
+
+`bpfrig` re-exports `aya` (`pub use aya;`) so its macros can name it as
+`$crate::aya`. Tools still depend on `aya = "0.14"` themselves, and Cargo
+unifies the two.
+
+## bpfrig (userspace)
+
+The API shapes below are sketches, not final signatures.
+
+### btf: struct offsets from vmlinux BTF
+
+Replaces `src/btf.rs` in unix-gc, vsock and btr, which are identical
+apart from the module doc. Also replaces the `OFFSETS` table and resolve
+loop in each tool's `load_object`, and the
+`offsets_resolve_against_running_kernel` test.
+
+It is still needed with aya 0.14. aya parses BTF but keeps `type_by_id`
+and the member accessors crate-private (aya-obj 0.3), and aya-ebpf has no
+CO-RE read helpers, so nothing relocates a field access at load time.
+Instead, the loader resolves the offsets and patches them into `OFF_*`
+globals.
+
+```rust
+/// Struct layouts from the running kernel's BTF.
+pub struct Layouts { .. }
+
+impl Layouts {
+    pub fn from_sys_fs() -> Result<Self>;
+    pub fn parse(raw: &[u8]) -> Result<Self>;
+    pub fn offset_of(&self, root: &str, path: &[&str]) -> Result<u32>;
+}
+
+/// One loader-patched offset: the global it fills and the member path.
+pub struct Offset {
+    pub global: &'static str,
+    pub root: &'static str,
+    pub path: &'static [&'static str],
+}
+```
+
+It is named `Layouts` rather than `Btf` because the LSM attach path needs
+`aya::Btf` in the same files. Today unix-gc and vsock work around the name
+clash with a qualified `btf::Btf`.
+
+Changes from the copied reader:
+
+- `offset_of` rejects a member that is a bitfield or not byte-aligned.
+  Today it adds `bit_offset / 8`, which truncates and returns a wrong
+  offset instead of an error. No current path reads a bitfield.
+- A path that runs into a non-struct type (a pointer, say) names the
+  member it stopped at.
+- The parser gets unit tests against a small synthetic BTF blob, so it is
+  tested without a kernel. `bpfrig::btf::check_offsets(OFFSETS)` replaces
+  the per-tool resolve test. As today, it skips when vmlinux BTF is
+  missing.
+
+### ObjectLoader: load with patched globals
+
+Replaces `load_object` in unix-gc, vsock and btr, and flood's
+`EbpfLoader::new().set_max_entries(..)`.
+
+```rust
+let ebpf = ObjectLoader::new(bpfrig::embed!("unix_gc_guard_ebpf"))
+    .offsets(&layouts, OFFSETS)?
+    .global("DENY_ERRNO", mode.deny_errno())
+    .load()?;
+```
+
+- The loader owns the patched values, stored as bytes.
+  `EbpfLoader::override_global` borrows them until `load()` returns, which
+  is why btr has a comment about keeping the offsets alive. With a builder
+  that owns them, that cannot go wrong.
+- Every override uses `must_exist = true`. A renamed or optimised-away
+  global is a load error, never a program that reads at offset zero.
+- `embed!(name)` expands to
+  `$crate::aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/", name))`.
+  `env!` expands in the calling crate, so it sees the tool's `OUT_DIR`.
+
+### pins: bpffs and pin-directory bookkeeping
+
+Replaces:
+
+- `ensure_bpffs` (4 copies);
+- `pinned_files`, `remove_pins`, the "already loaded: <dir> exists" check
+  and the `link_` prefix (3 copies each);
+- the "remove every pin if the self-test fails" step in `load()`;
+- flood's `PinGuard`.
+
+```rust
+pub fn ensure_bpffs() -> Result<()>;
+
+pub struct PinDir { .. }   // /sys/fs/bpf/<tool>, or under flood's --bpffs
+
+impl PinDir {
+    pub fn new(tool: &str) -> Result<Self>;
+    pub fn under(bpffs: &Path, tool: &str) -> Result<Self>;
+    pub fn exists(&self) -> bool;
+    pub fn path(&self, name: &str) -> Result<PathBuf>;     // rejects '.' and '/'
+    pub fn link_path(&self, sym: &str) -> Result<PathBuf>; // link_<sym>
+    pub fn files(&self) -> Vec<String>;
+    pub fn remove_all(&self) -> Result<()>;
+    pub fn claim(&self, existing: Existing) -> Result<PinTxn<'_>>;
+}
+
+/// Removes every pin in the directory on drop unless committed.
+pub struct PinTxn<'a> { .. }
+
+impl PinTxn<'_> {
+    pub fn commit(self);
+}
+```
+
+- Because `path` refuses a `.`, a known bpffs pitfall can no longer happen:
+  `bpf_lookup()` returns EPERM for a path component containing a dot,
+  and the error only appears at `BPF_OBJ_PIN`, after the attach has
+  already succeeded.
+- `claim` runs `ensure_bpffs`, applies the `Existing` policy, creates the
+  directory and returns the transaction. `Existing::Refuse` is the guard
+  tools' "already loaded". `Existing::ReplaceStale` is flood's behavior:
+  refuse if a loaded program still uses a pinned map (`map_in_use`),
+  otherwise clear the pins.
+- The guard tools call `commit()` after the self-test passes. flood holds
+  the transaction for the whole of `run` and never commits it, so its pins
+  are removed on any exit, including a panic unwind. That is what
+  `PinGuard` does now.
+
+### probes: kprobe tables
+
+Replaces `Probe`, the table-driven `attach_tripwire` and `ksyms()` in
+unix-gc, vsock and btr, plus btr's `jit_probe_attached` and
+`clone_probe_attached`.
+
+```rust
+pub struct Probe {
+    pub prog: &'static str,
+    pub syms: &'static [&'static str],
+    pub first_only: bool,   // the same call site under several names
+    pub required: bool,     // absence fails the load
+}
+
+pub fn ksyms() -> Result<BTreeSet<String>>;
+
+pub fn attach_kprobes<'p>(
+    ebpf: &mut Ebpf,
+    probes: impl IntoIterator<Item = &'p Probe>,
+    pins: &PinTxn,
+) -> Result<Vec<Attached>>;
+
+pub fn probe_attached(pins: &PinDir, probe: &Probe) -> bool;
+
+/// One line of the load report.
+pub enum Attached { Kprobe { .. }, Missing { .. }, Lsm { .. } }
+```
+
+- The caller decides which probes run by passing them in. Neither a flag
+  in the table nor a program name in the loop decides it. Optional probes
+  become named consts:
+  - btr chains `CLONE_PROBE` in kill mode, and
+    `probe_attached(&CLONE_PROBE)` reads the same const, so its symbol
+    list exists only once;
+  - unix-gc chains `GC_WAIT_PROBE` under `--gc-wait-probe`.
+- A missing optional probe is reported as `Attached::Missing`. A missing
+  required probe fails the load, and so does attaching nothing at all.
+- A link that fell back to legacy debugfs cannot be pinned, and that stays
+  an explicit error, as now.
+
+### lsm: the bpf LSM
+
+Replaces:
+
+- `bpf_lsm_active` in deny-sctp, unix-gc and vsock;
+- `attach_lsm` and its pin, in the same three tools (vsock's `LsmTarget`
+  version is the general one);
+- the "bpf is not in the active LSM list" refusal, in the same three
+  tools;
+- `BootLsm`, `boot_lsm`, `lsm_from_boot_file` and
+  `warn_unless_persistent`, which are identical in unix-gc and vsock.
+
+```rust
+pub fn bpf_lsm_active() -> bool;
+pub fn require_bpf_lsm(instead: &str) -> Result<()>;
+
+pub struct LsmTarget {
+    pub prog: &'static str,
+    pub hook: &'static str,
+    pub pin: &'static str,
+}
+
+pub fn attach_lsm(ebpf: &mut Ebpf, target: &LsmTarget, pins: &PinTxn) -> Result<Attached>;
+
+pub enum BootLsm { Enabled, Missing, Unknown }
+pub struct BootLsmVerdict { pub state: BootLsm, pub source: String }
+
+pub fn boot_lsm() -> BootLsmVerdict;
+pub fn warn_unless_persistent();
+```
+
+`boot_lsm` keeps its rules, in this order:
+
+1. The persistent cmdline files: `/etc/kernel/cmdline`, then
+   `/etc/default/grub`. Comments and non-`GRUB_CMDLINE_LINUX*` lines are
+   ignored, and the last `lsm=` wins.
+2. The running kernel's `CONFIG_LSM`.
+3. Otherwise `Unknown`, rather than a guess.
+
+The comments drop their fleet-specific detail on the way in. The technical
+warning stays: `lsm=` replaces the built-in list, so leaving out apparmor
+silently disables LXC confinement.
+
+### maps: pinned maps and counters
+
+Replaces:
+
+- `open_stats` and `counter` (3 copies);
+- btr's `open_loaders`, `open_config`, `open_kills`, `open_parents` and
+  `open_exempt`;
+- flood's `open_policy`, `enable_policy_kinds_pinned` and
+  `pinned_allow_exempts`;
+- btr's `pin_maps`, and the STATS pin in the other guard tools.
+
+```rust
+pub fn open_pinned<T>(path: &Path) -> Result<T>
+where
+    T: TryFrom<Map, Error = MapError>;
+
+pub fn pin_maps(ebpf: &mut Ebpf, maps: &[(&str, &str)], pins: &PinTxn) -> Result<()>;
+pub fn map_in_use(map: &MapData) -> Option<bool>;
+
+/// A per-CPU u64 array indexed by a slot enum.
+pub struct Counters<S> { .. }
+
+impl<S: Copy + Display + Into<u32>> Counters<S> {
+    pub fn open(path: &Path) -> Result<Self>;
+    pub fn get(&self, slot: S) -> Result<u64>;   // summed over CPUs
+    pub fn moved<R>(&self, slot: S, f: impl FnOnce() -> R) -> Result<(u64, R)>;
+}
+```
+
+- `open_pinned` runs `MapData::from_pin`, then `Map::from_map_data`, then
+  `T::try_from`. In aya 0.14, `from_map_data` takes the map variant from
+  the kernel's map type. Today every call site picks the variant by hand
+  (`Map::LruHashMap(data)`), and aya checks only the key and value sizes
+  against the kernel, so a wrong variant is not caught. The error keeps
+  the "(not loaded?)" hint.
+- `moved` is the self-test step that all three guard tools write by hand:
+  read a slot, run the trigger, read the slot again, then return the
+  difference and the trigger's result. The triggers stay in the tools.
+
+### progs: privileges and live programs
+
+Replaces the root check (4 copies) and the "live programs" block in
+`status()` (4 identical copies, including the reduced output without
+root).
+
+```rust
+pub fn require_root() -> Result<()>;
+
+/// Implements Display for the status report.
+pub enum LivePrograms { Found(Vec<(String, u32)>), NoneLoaded, NeedsRoot }
+
+pub fn live_programs(names: &[&str]) -> LivePrograms;
+```
+
+### batch: BPF_MAP_*_BATCH
+
+Replaces the generic core of flood's `batch.rs`. aya 0.14 still has no
+batch API.
+
+These parts move:
+
+- the `BPF_MAP_LOOKUP_BATCH` / `LOOKUP_AND_DELETE_BATCH` loop. It resumes
+  from the kernel's bucket token, so unlike a `GET_NEXT_KEY` walk it
+  finishes even while an LRU map churns;
+- chunk growth on ENOSPC;
+- the per-thread reusable buffers;
+- `UPDATE_BATCH` and `DELETE_BATCH`;
+- the per-CPU value stride;
+- the fallback rule: when the kernel says batch ops are unsupported, use
+  per-key access for good; after any other error, fall back for that call
+  only.
+
+The kill switch becomes a parameter, and flood keeps its `FLOOD_NO_BATCH`.
+Decoding returns typed keys and values (`read_unaligned` from the byte
+buffers), instead of each caller unpacking raw bytes. flood keeps its
+decoders for its own types, and its `walk_cap` policy for the per-key
+fallback.
+
+### host: small kernel facts
+
+Replaces:
+
+- btr's `monotonic_ns` and flood's `now_ktime_ns`. They are the same
+  function, except that flood's ignores a `clock_gettime` failure;
+- the three readers of `/boot/config-<release>`: unix-gc and vsock in
+  `boot_lsm`, and btr for `CONFIG_BPF_JIT_ALWAYS_ON`.
+
+```rust
+pub const NS_PER_SEC: u64 = 1_000_000_000;
+
+/// CLOCK_MONOTONIC, the bpf_ktime_get_ns() basis.
+pub fn ktime_ns() -> Result<u64>;
+pub fn os_release() -> Option<String>;
+
+pub struct KernelConfig { .. }
+
+impl KernelConfig {
+    /// /boot/config-<release> of the running kernel.
+    pub fn running() -> Option<Self>;
+    pub fn get(&self, key: &str) -> Option<&str>;
+}
+```
+
+### net (feature): XDP and TC
+
+Replaces these flood functions:
+
+- `verify_xdp_mode` and `xdp_mode_of`;
+- `ifindex_of`, `mtu_of` and `bond_slaves`;
+- the TC egress attach in `EgressHook::attach`, which tries TCX first and
+  falls back to netlink plus a clsact qdisc.
+
+flood is the only user today. These go in because the next XDP or TC tool
+would otherwise copy them. They sit behind a `net` feature so the guard
+tools don't build them.
+
+## bpfrig-ebpf (BPF side, no_std)
+
+| Item | Where it is today |
+|---|---|
+| `global_u32(&OFF_X)`: reads a loader-patched global with `read_volatile`, so the compiler cannot const-fold the placeholder zero | `cfg_u32` in unix-gc, vsock and btr. It returns `usize` in two of them and `u32` in btr; unify on `u32` |
+| `read_at::<T>(base, off)` and `deref_at(base, off)`, both over `bpf_probe_read_kernel` | unix-gc, vsock |
+| `bump(map, slot)` for a per-CPU u64 array | 4 copies, each hard-wired to its own `STATS`. flood's `bump_u64` already takes the map as a parameter |
+| `prev_verdict(ctx, hook_args)`: the previous LSM verdict, which comes after the hook's own arguments | 3 LSM programs |
+| `atomic_inc_u64` / `atomic_inc_u32` via `atomic_xadd`, with a host fallback so a stable `cargo check` still builds. The bpfel `core` has no atomic read-modify-write | btr only. It moves anyway, so nobody has to work it out again |
+| `consts`: `AF_*`, `SOCK_*`, `MSG_*`, `IPPROTO_*`, errno and signal numbers | each crate spells out its own subset, with different integer types. Address families become `u16` (`sa_family_t`), widened where they are compared |
+| `program!()` / `program!("Dual MIT/GPL")`: emits the `license` section static and the panic handler | 5 copies |
+
+The kernel checks the `license` string before it allows GPL-only helpers
+(`bpf_probe_read_kernel`, `bpf_send_signal`). It is separate from the
+crates' own license. The macro defaults to today's `"GPL"`.
+
+flood's packet parsing (`ptr_at`, `load`, and the L2/L3/L4 walkers) does
+not move. It has one user and is specific to its datapath. Revisit when a
+second XDP or TC tool appears.
+
+## bpfrig-build
+
+Replaces the four identical CVE `build.rs` files and flood's extended one.
+
+```rust
+fn main() -> anyhow::Result<()> {
+    bpfrig_build::build_ebpf("unix-gc-guard-ebpf")
+}
+```
+
+- It finds the crate and its `[[bin]]` target through the
+  `cargo_metadata` crate, which aya-build already depends on, so the call
+  only needs the package name.
+- It fails with a clear message when the bin name equals the package name.
+  aya-build builds in `OUT_DIR/<package>` and copies the object to
+  `OUT_DIR/<bin>`, so equal names collide. Every eBPF crate's
+  `Cargo.toml` carries a comment about this today.
+- It emits `rerun-if-changed` for every path dependency of the eBPF crate.
+  Today only flood does this, by hand, for `flood-common`. Without it, an
+  edit to the shared ABI types rebuilds userspace against the new layout
+  while `OUT_DIR` keeps the old object.
+- `SKIP_EBPF_BUILD` writes an empty stub at `OUT_DIR/<bin>` and warns, so
+  userspace can be checked without nightly and bpf-linker. This is flood's
+  workaround, now available to every tool.
+
+## The ABI convention: a `-common` crate per tool
+
+This is not library code, but it is part of the migration. Today the
+guard tools keep their userspace and BPF definitions in sync by comment
+("Kept in sync with the loader's Stat enum"). btr adds an `offset_of!`
+test over three duplicated structs. flood's `flood-common` is the pattern
+to copy:
+
+- `no_std`, with every type `#[repr(C)]` and explicit padding;
+- a `user` feature that adds the `aya::Pod` impls, and strum derives for
+  slot enums, on the userspace side only;
+- the slot enum declared `#[repr(u32)]`, so both sides index the stats
+  map with the same values;
+- map capacities as shared consts;
+- the layout tests in the common crate.
+
+Because `bpfrig-build` emits `rerun-if-changed` automatically, this works
+without editing each tool's `build.rs`.
+
+## Drift the merge resolves
+
+1. The kprobe table means three different things.
+   - unix-gc has `opt_in`, skips missing symbols silently, and fails only
+     if nothing attached.
+   - vsock and btr have `required`, and report what they skipped.
+   - btr also gates `btt_clone` by program name inside the attach loop,
+     and `clone_probe_attached` repeats the table's symbol list.
+
+   See "probes" for the unified table.
+2. `btf.rs` truncates bitfield offsets (see "btf").
+3. When `/proc/self/mounts` cannot be read, deny-sctp's `ensure_bpffs`
+   tries to mount bpffs anyway, while the others fail.
+4. flood's clock read ignores a `clock_gettime` failure; btr's checks for
+   it.
+5. `cfg_u32` returns `usize` in two crates and `u32` in the third.
+6. The map variant for a pinned map is chosen by hand at every call site
+   (see "maps").
+
+## Stays in the tools
+
+- CLIs, modes, and which programs each mode attaches.
+- Self-test triggers: the socketpair peek, the vsock sends, the seccomp
+  burst and the kill-mode orchestrator.
+- Exposure and host checks: vsock's module, autoload and loopback
+  reachability, and btr's JIT, retpoline and fix-symbol verdict.
+- btr's kill-mode maps, reporting and `--watch`.
+- deny-sctp's attach at the cgroup v2 root, with its temporary cgroup2
+  mount. It has one user; it is generic enough to move once a second tool
+  needs it.
+- flood's datapath, policy, auto-actions and TUI.
+
+## Phase 2: a load-sequence skeleton
+
+unix-gc, vsock and btr each have a `load()` of roughly 70 lines that runs
+the same sequence:
+
+1. Make sure bpffs is mounted.
+2. Claim the pin directory.
+3. Load the object with patched globals.
+4. btr only: fill in the config maps.
+5. Attach the programs.
+6. Pin the maps.
+7. Run the self-test.
+8. Commit the pins, or remove every pin on failure.
+9. Print the report.
+
+Once the phase-1 pieces exist, this could become a struct with hooks
+(`arm`, `attach`, `verify`). This waits until all three tools use the
+helpers, because each tool needs its hooks at different points in the
+sequence.
+
+## Constraints and decisions
+
+- **aya 0.14 is the minimum.** There is no 0.13 compatibility.
+  edge-xdp-flood adopts bpfrig together with its aya upgrade. Its comment
+  that 0.13.1 lacks `Map::from_map_data` no longer applies after the
+  upgrade.
+- **License: MIT OR Apache-2.0.** edge-xdp-flood is GPL-2.0-only and the
+  CVE tools are MIT OR Apache-2.0. The dual permissive license works for
+  both, whereas a GPL library would force the CVE tools to relicense.
+- **Edition 2024** (Rust 1.85 or newer). edge-xdp-flood's 2021-edition
+  crates can depend on it unchanged.
+- **Errors: anyhow.** Every consumer is an anyhow binary, and much of the
+  value is in the context strings ("is CONFIG_DEBUG_INFO_BTF set?").
+  Revisit if a consumer needs to match on error kinds.
+- **Hosting: GitHub.** Consumers use a git dependency pinned to a tag.
+  While developing both sides at once, a `[patch]` entry points the tool
+  at the local checkout.
+- **Public repository.** Code and comments moved into this crate keep the
+  technical reasoning but drop host names and fleet-specific detail.
+
+## Migration order
+
+1. `bpfrig-build`, then `btf`, `ObjectLoader`, `pins`, `probes`, `lsm`,
+   `maps`, `progs` and `host`. Migrate unix-gc and vsock first. They are
+   the closest pair, so an API that fits one and not the other shows up
+   immediately.
+2. btr and deny-sctp. btr tests optional probes, several pinned maps, and
+   `Counters` across modes.
+3. `bpfrig-ebpf`, alongside each tool's BPF crate and its new `-common`
+   crate.
+4. `batch` and `net`, together with edge-xdp-flood's aya upgrade.
+
+Check each migrated tool as root on a test machine. Run the full
+`--load` / `--check` / `--stats` / `--unload` cycle in every mode, and
+make sure its self-test passes unchanged.
+
+## Open questions
+
+1. Under the unified table, unix-gc's probes become `required`. `unix_gc`
+   and the `unix_*_recvmsg` family exist on every 6.x kernel checked, so
+   unix-gc would start failing where it now skips. Is that acceptable?
+2. Should the `net` helpers go behind a feature or into their own crate?
+3. Should the default BPF license string stay `"GPL"`, or become
+   `"Dual MIT/GPL"` to match the crates' own license?
+4. The four `build-dist.sh` scripts differ only in the binary name. Should
+   they be shared (as a script in this repo, or an xtask), or left alone?

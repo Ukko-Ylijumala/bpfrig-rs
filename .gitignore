@@ -1,0 +1,8 @@
+# Rust build output
+/target
+
+# Git worktrees for parallel work live inside the repo, never committed
+/.worktrees
+
+# Personal Claude Code settings
+/.claude/settings.local.json
