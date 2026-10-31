@@ -3,7 +3,8 @@
 Status: the CVE-tool part of phase 1 is implemented as v0.1.0
 (2026-10-31): `bpfrig-build`, `bpfrig-ebpf`, and `bpfrig` except the
 flood-only pieces (`batch`, `net`, `map_in_use` and the replace-stale pin
-policy). No tool uses it yet; see "Trial ports" for how it was checked.
+policy). The four CVE tools are ported onto it on a `bpfrig` branch in
+each repository, as git dependencies on the `v0.1.0` tag; see "Ports".
 Proposal written 2026-10-22, revised 2026-10-31 after edge-xdp-flood moved
 to aya 0.14. Based on a read-through of the five aya-based tools listed
 under "Consumers". Each inventory entry names the functions it replaces.
@@ -625,10 +626,11 @@ Check each migrated tool as root on a test machine. Run the full
 `--load` / `--check` / `--stats` / `--unload` cycle in every mode, and
 make sure its self-test passes unchanged.
 
-### Trial ports (2026-10-31)
+### Ports (2026-10-31)
 
 Before v0.1.0 was tagged, all four CVE tools were ported to it in scratch
-copies (the repositories themselves are untouched): userspace onto
+copies; after the tag the same ports went into the repositories, on a
+`bpfrig` branch each. Userspace moved onto
 `bpfrig`, `build.rs` onto `bpfrig-build`, and the BPF crates onto aya-ebpf
 0.2 and `bpfrig-ebpf` (`Global<u32>` offsets, `bump(&STATS, ..)`,
 `read_at`/`deref_at`, `prev_verdict`, `consts`, `program!()`).
@@ -639,7 +641,12 @@ copies (the repositories themselves are untouched): userspace onto
 - btr's kprobe section is the same size as before, 0x2658 bytes, so the
   shared atomics and `bump` inline exactly like the hand-written ones.
   unix-gc's LSM program is one instruction longer (0x310 against 0x308
-  bytes), from adding `u32` offsets before widening them.
+  bytes), from adding `u32` offsets before widening them. vsock's
+  `lsm/socket_sendmsg` is nine longer (0x2e8 against 0x2a0): LLVM packs
+  the `Option<u32>` from `read_at` into one register and unpacks it again.
+  Harmless scalar shuffling, but a `Result`-returning `read_at` might fold
+  it away if it ever matters. Baselines are the unported tools rebuilt on
+  aya-ebpf 0.2.
 - `SKIP_EBPF_BUILD=1` writes the stub; an edit in `bpfrig-ebpf` re-runs
   the eBPF build, and one in `bpfrig` does not.
 - Not done: loading through the verifier and the root-only cycle above.
@@ -649,13 +656,11 @@ Behavior changes a real port brings, on top of the open questions:
 - unix-gc's probes stay optional, but a missing one is now listed in the
   load report (`-> not attached (... absent from /proc/kallsyms)`), where
   it used to be skipped silently.
-- btr's "loaded by an older version?" hint for a missing HOSTILE_PARENTS
-  pin becomes the generic "(not loaded?)".
 - The LSM refusal now always explains that `lsm=` replaces the built-in
   list; deny-sctp's version did not.
 - With aya-ebpf 0.2, `LsmContext::arg` is safe, so `unsafe` blocks that
-  only wrapped `ctx.arg()` (deny-sctp, vsock's `create_verdict`) become
-  unnecessary and warn.
+  only wrapped `ctx.arg()` (deny-sctp, vsock's `create_verdict`) became
+  unnecessary; the ports drop them.
 
 ## Open questions
 

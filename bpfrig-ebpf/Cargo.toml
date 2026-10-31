@@ -4,6 +4,7 @@ description = "no_std helpers for the BPF side of aya tools: kernel reads, per-C
 version.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
 edition.workspace = true
 publish.workspace = true
 rust-version = "1.87"

@@ -20,10 +20,10 @@ project. `bpfrig-build` needs rustc 1.98 (aya-build 0.2.1's floor).
 
 ```toml
 [dependencies]
-bpfrig = { git = "<this repository>", tag = "v0.1.0" }
+bpfrig = { git = "https://github.com/Ukko-Ylijumala/bpfrig-rs", tag = "v0.1.0" }
 
 [build-dependencies]
-bpfrig-build = { git = "<this repository>", tag = "v0.1.0" }
+bpfrig-build = { git = "https://github.com/Ukko-Ylijumala/bpfrig-rs", tag = "v0.1.0" }
 ```
 
 The tool's BPF crate depends on `bpfrig-ebpf` from the same tag, and on

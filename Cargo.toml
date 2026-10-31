@@ -6,6 +6,7 @@ members = ["bpfrig", "bpfrig-build", "bpfrig-ebpf"]
 version = "0.1.0"
 authors = ["Mikko Tanner <mikko.tanner@gmail.com>"]
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Ukko-Ylijumala/bpfrig-rs"
 edition = "2024"
 publish = false
 

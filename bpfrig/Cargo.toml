@@ -4,6 +4,7 @@ description = "Shared loading plumbing for aya-based eBPF tools: BTF offsets, pi
 version.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
 edition.workspace = true
 publish.workspace = true
 rust-version = "1.87"
