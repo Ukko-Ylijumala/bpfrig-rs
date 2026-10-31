@@ -1,0 +1,16 @@
+[package]
+name = "bpfrig-ebpf"
+description = "no_std helpers for the BPF side of aya tools: kernel reads, per-CPU counters, atomics, constants"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version = "1.87"
+keywords = ["ebpf", "bpf", "aya", "no_std"]
+
+[dependencies]
+# A tool's BPF crate must use the same aya-ebpf version: its #[map] and
+# program macros expand to ::aya_ebpf paths, and the map types bump() takes
+# have to be the ones the tool declares.
+aya-ebpf.workspace = true

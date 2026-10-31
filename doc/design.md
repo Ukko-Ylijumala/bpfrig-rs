@@ -1,9 +1,12 @@
 # bpfrig: shared eBPF loading library — design
 
-Status: proposal, nothing implemented yet (2026-10-22; revised 2026-10-31
-after edge-xdp-flood moved to aya 0.14). Based on a read-through of the
-five aya-based tools listed under "Consumers". Each inventory entry names
-the functions it would replace.
+Status: the CVE-tool part of phase 1 is implemented as v0.1.0
+(2026-10-31): `bpfrig-build`, `bpfrig-ebpf`, and `bpfrig` except the
+flood-only pieces (`batch`, `net`, `map_in_use` and the replace-stale pin
+policy). No tool uses it yet; see "Trial ports" for how it was checked.
+Proposal written 2026-10-22, revised 2026-10-31 after edge-xdp-flood moved
+to aya 0.14. Based on a read-through of the five aya-based tools listed
+under "Consumers". Each inventory entry names the functions it replaces.
 
 ## Why
 
@@ -159,33 +162,40 @@ pub fn ensure_bpffs() -> Result<()>;
 pub struct PinDir { .. }   // /sys/fs/bpf/<tool>, or under flood's --bpffs
 
 impl PinDir {
-    pub fn new(tool: &str) -> Result<Self>;
-    pub fn under(bpffs: &Path, tool: &str) -> Result<Self>;
+    pub fn new(tool: &str) -> Self;                   // panics on a bad name
+    pub fn under(bpffs: &Path, tool: &str) -> Self;
     pub fn exists(&self) -> bool;
     pub fn path(&self, name: &str) -> Result<PathBuf>;     // rejects '.' and '/'
     pub fn link_path(&self, sym: &str) -> Result<PathBuf>; // link_<sym>
+    pub fn has(&self, name: &str) -> bool;
     pub fn files(&self) -> Vec<String>;
     pub fn remove_all(&self) -> Result<()>;
-    pub fn claim(&self, existing: Existing) -> Result<PinTxn<'_>>;
+    pub fn claim(&self) -> Result<PinTxn<'_>>;
 }
 
 /// Removes every pin in the directory on drop unless committed.
+/// Derefs to the PinDir.
 pub struct PinTxn<'a> { .. }
 
 impl PinTxn<'_> {
     pub fn commit(self);
+    pub fn pin_link(&self, link: FdLink, name: &str) -> Result<PathBuf>;
 }
 ```
 
+- `PinDir::new` panics rather than returning an error, because the tool
+  name is always a constant: an invalid one is a bug. Pin names stay
+  fallible; a kprobe link's name comes from kallsyms, where names such as
+  `foo.cold` exist.
 - Because `path` refuses a `.`, a known bpffs pitfall can no longer happen:
   `bpf_lookup()` returns EPERM for a path component containing a dot,
   and the error only appears at `BPF_OBJ_PIN`, after the attach has
   already succeeded.
-- `claim` runs `ensure_bpffs`, applies the `Existing` policy, creates the
-  directory and returns the transaction. `Existing::Refuse` is the guard
-  tools' "already loaded". `Existing::ReplaceStale` is flood's behavior:
-  refuse if a loaded program still uses a pinned map (`map_in_use`),
-  otherwise clear the pins.
+- `claim` runs `ensure_bpffs`, refuses when the directory exists (the
+  guard tools' "already loaded"), creates it and returns the transaction.
+  flood's behavior comes with its migration, as a second constructor or an
+  `Existing` policy argument: refuse if a loaded program still uses a
+  pinned map (`map_in_use`), otherwise clear the pins.
 - The guard tools call `commit()` after the self-test passes. flood holds
   the transaction for the whole of `run` and never commits it, so its pins
   are removed on any exit, including a panic unwind. That is what
@@ -373,16 +383,23 @@ pub const NS_PER_SEC: u64 = 1_000_000_000;
 
 /// CLOCK_MONOTONIC, the bpf_ktime_get_ns() basis.
 pub fn ktime_ns() -> Result<u64>;
-pub fn os_release() -> Option<String>;
+pub fn os_release() -> Result<String>;
+/// Mount points of one fstype, from /proc/self/mounts.
+pub fn mounts_of(fstype: &str) -> Result<Vec<PathBuf>>;
 
 pub struct KernelConfig { .. }
 
 impl KernelConfig {
-    /// /boot/config-<release> of the running kernel.
-    pub fn running() -> Option<Self>;
-    pub fn get(&self, key: &str) -> Option<&str>;
+    /// /boot/config-<release> of the running kernel. The error names the
+    /// missing file, short enough to quote as a verdict's source.
+    pub fn running() -> Result<Self>;
+    pub fn get(&self, key: &str) -> Option<&str>;   // quotes stripped
+    pub fn enabled(&self, key: &str) -> bool;       // =y
 }
 ```
+
+`mounts_of` is deny-sctp's helper; `ensure_bpffs` uses it, and deny-sctp
+keeps using it to find the cgroup2 mount.
 
 ### net (feature): XDP and TC
 
@@ -472,14 +489,20 @@ fn main() -> anyhow::Result<()> {
 - It finds the crate and its `[[bin]]` target through the
   `cargo_metadata` crate, which aya-build already depends on, so the call
   only needs the package name.
-- It fails with a clear message when the bin name equals the package name.
-  aya-build builds in `OUT_DIR/<package>` and copies the object to
-  `OUT_DIR/<bin>`, so equal names collide. Every eBPF crate's
-  `Cargo.toml` carries a comment about this today.
-- It emits `rerun-if-changed` for every path dependency of the eBPF crate.
-  Today only flood does this, by hand, for `flood-common`. Without it, an
-  edit to the shared ABI types rebuilds userspace against the new layout
-  while `OUT_DIR` keeps the old object.
+- The planned check that the bin name differs from the package name is
+  not needed. aya-build 0.2 builds in `OUT_DIR/aya-build/target/<package>`
+  and copies to `OUT_DIR/<bin>`, so equal names no longer collide. The
+  "Must differ from the package name" comment in each eBPF crate's
+  `Cargo.toml` can go when the crate moves to aya-build 0.2.
+- It emits `rerun-if-changed` for every local package the eBPF crate
+  depends on, directly or not: path dependencies, and `[patch]`ed local
+  checkouts. Today only flood does this, by hand, for `flood-common`.
+  Without it, an edit to the shared ABI types rebuilds userspace against
+  the new layout while `OUT_DIR` keeps the old object. It also watches
+  `Cargo.lock`, which is where a git or registry dependency (`bpfrig-ebpf`
+  from a tag) changes.
+- `cargo metadata` runs with `--offline`; the build already resolved
+  everything.
 - `SKIP_EBPF_BUILD` writes an empty stub at `OUT_DIR/<bin>` and warns, so
   userspace can be checked without nightly and bpf-linker. This is flood's
   workaround, now available to every tool.
@@ -515,7 +538,8 @@ without editing each tool's `build.rs`.
    See "probes" for the unified table.
 2. `btf.rs` truncates bitfield offsets (see "btf").
 3. When `/proc/self/mounts` cannot be read, deny-sctp's `ensure_bpffs`
-   tries to mount bpffs anyway, while the others fail.
+   tries to mount bpffs anyway, while the others fail. bpfrig fails:
+   mounting a second bpffs over a populated one would hide every pin.
 4. flood's clock read ignores a `clock_gettime` failure; btr's checks for
    it.
 5. `cfg_u32` returns `usize` in two crates and `u32` in the third.
@@ -600,6 +624,38 @@ sequence.
 Check each migrated tool as root on a test machine. Run the full
 `--load` / `--check` / `--stats` / `--unload` cycle in every mode, and
 make sure its self-test passes unchanged.
+
+### Trial ports (2026-10-31)
+
+Before v0.1.0 was tagged, all four CVE tools were ported to it in scratch
+copies (the repositories themselves are untouched): userspace onto
+`bpfrig`, `build.rs` onto `bpfrig-build`, and the BPF crates onto aya-ebpf
+0.2 and `bpfrig-ebpf` (`Global<u32>` offsets, `bump(&STATS, ..)`,
+`read_at`/`deref_at`, `prev_verdict`, `consts`, `program!()`).
+
+- All four build, their unit tests pass (btr's nine, and the offset test
+  in unix-gc, vsock and btr through `check_offsets`), and `--status` runs
+  unprivileged.
+- btr's kprobe section is the same size as before, 0x2658 bytes, so the
+  shared atomics and `bump` inline exactly like the hand-written ones.
+  unix-gc's LSM program is one instruction longer (0x310 against 0x308
+  bytes), from adding `u32` offsets before widening them.
+- `SKIP_EBPF_BUILD=1` writes the stub; an edit in `bpfrig-ebpf` re-runs
+  the eBPF build, and one in `bpfrig` does not.
+- Not done: loading through the verifier and the root-only cycle above.
+
+Behavior changes a real port brings, on top of the open questions:
+
+- unix-gc's probes stay optional, but a missing one is now listed in the
+  load report (`-> not attached (... absent from /proc/kallsyms)`), where
+  it used to be skipped silently.
+- btr's "loaded by an older version?" hint for a missing HOSTILE_PARENTS
+  pin becomes the generic "(not loaded?)".
+- The LSM refusal now always explains that `lsm=` replaces the built-in
+  list; deny-sctp's version did not.
+- With aya-ebpf 0.2, `LsmContext::arg` is safe, so `unsafe` blocks that
+  only wrapped `ctx.arg()` (deny-sctp, vsock's `create_verdict`) become
+  unnecessary and warn.
 
 ## Open questions
 

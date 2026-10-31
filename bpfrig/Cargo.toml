@@ -1,0 +1,16 @@
+[package]
+name = "bpfrig"
+description = "Shared loading plumbing for aya-based eBPF tools: BTF offsets, pins, kprobe tables, the bpf LSM, pinned maps"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version = "1.87"
+keywords = ["ebpf", "bpf", "aya"]
+
+[dependencies]
+anyhow.workspace = true
+aya.workspace = true
+nix.workspace = true
+strum.workspace = true

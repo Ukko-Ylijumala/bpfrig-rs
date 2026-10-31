@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["bpfrig", "bpfrig-build", "bpfrig-ebpf"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Mikko Tanner <mikko.tanner@gmail.com>"]
+license = "MIT OR Apache-2.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+aya = "0.14"
+aya-build = "0.2"
+aya-ebpf = "0.2"
+cargo_metadata = { version = "0.23", default-features = false }
+nix = { version = "0.30", features = ["mount", "time", "user"] }
+strum = { version = "0.27", features = ["derive"] }
