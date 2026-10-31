@@ -3,7 +3,7 @@ resolver = "3"
 members = ["bpfrig", "bpfrig-build", "bpfrig-ebpf"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Mikko Tanner <mikko.tanner@gmail.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Ukko-Ylijumala/bpfrig-rs"
