@@ -1,8 +1,9 @@
 # bpfrig: shared eBPF loading library — design
 
-Status: proposal, nothing implemented yet (2026-10-22). Based on a
-read-through of the five aya-based tools listed under "Consumers". Each
-inventory entry names the functions it would replace.
+Status: proposal, nothing implemented yet (2026-10-22; revised 2026-10-31
+after edge-xdp-flood moved to aya 0.14). Based on a read-through of the
+five aya-based tools listed under "Consumers". Each inventory entry names
+the functions it would replace.
 
 ## Why
 
@@ -16,13 +17,13 @@ it makes the next tool mostly policy rather than plumbing.
 
 ## Consumers
 
-| Tool (repository) | BPF programs | Lifecycle | aya |
+| Tool (repository) | BPF programs | Lifecycle | aya / aya-ebpf / aya-build |
 |---|---|---|---|
-| edge-xdp-flood | XDP, TC egress classifier | resident process; map pins removed on exit | =0.13.1, moving to 0.14 |
-| deny-sctp (cve-2026-sctp) | `lsm/socket_create` or `cgroup/sock_create` | pin the link and exit | 0.14 |
-| unix-gc-guard (cve-2026-53361-af_unix_gc) | kprobes, `lsm/socket_recvmsg` | pin and exit, self-test | 0.14 |
-| vsock-zc-guard (cve-2026-53365-vsock-zerocopy) | kprobes, `lsm/socket_sendmsg`, `lsm/socket_create` | pin and exit, self-test | 0.14 |
-| btr-tripwire (cve-2026-64508-btr) | kprobes, kill-mode maps | pin and exit, self-test | 0.14 |
+| edge-xdp-flood | XDP, TC egress classifier | resident process; map pins removed on exit | 0.14 / 0.2 / 0.2 |
+| deny-sctp (cve-2026-sctp) | `lsm/socket_create` or `cgroup/sock_create` | pin the link and exit | 0.14 / 0.1 / 0.1 |
+| unix-gc-guard (cve-2026-53361-af_unix_gc) | kprobes, `lsm/socket_recvmsg` | pin and exit, self-test | 0.14 / 0.1 / 0.1 |
+| vsock-zc-guard (cve-2026-53365-vsock-zerocopy) | kprobes, `lsm/socket_sendmsg`, `lsm/socket_create` | pin and exit, self-test | 0.14 / 0.1 / 0.1 |
+| btr-tripwire (cve-2026-64508-btr) | kprobes, kill-mode maps | pin and exit, self-test | 0.14 / 0.1 / 0.1 |
 
 The three guard tools (unix-gc, vsock, btr) share the most. They have the
 same CLI shape (`--load`, `--unload`, `--status`, `--stats`, `--check`) and
@@ -54,8 +55,8 @@ Non-goals:
 bpfrig-rs/
   Cargo.toml        workspace
   bpfrig/           userspace library (aya 0.14)
-  bpfrig-ebpf/      no_std helpers for the BPF side (aya-ebpf)
-  bpfrig-build/     build-dependency wrapping aya-build
+  bpfrig-ebpf/      no_std helpers for the BPF side (aya-ebpf 0.2)
+  bpfrig-build/     build-dependency wrapping aya-build 0.2
   doc/
 ```
 
@@ -117,12 +118,16 @@ Changes from the copied reader:
 ### ObjectLoader: load with patched globals
 
 Replaces `load_object` in unix-gc, vsock and btr, and flood's
-`EbpfLoader::new().set_max_entries(..)`.
+`EbpfLoader::new().map_max_entries(..)`.
 
 ```rust
 let ebpf = ObjectLoader::new(bpfrig::embed!("unix_gc_guard_ebpf"))
     .offsets(&layouts, OFFSETS)?
     .global("DENY_ERRNO", mode.deny_errno())
+    .load()?;
+
+let ebpf = ObjectLoader::new(bpfrig::embed!("floodprog"))
+    .max_entries("SYNACK", args.protect_synack_entries)
     .load()?;
 ```
 
@@ -135,6 +140,8 @@ let ebpf = ObjectLoader::new(bpfrig::embed!("unix_gc_guard_ebpf"))
 - `embed!(name)` expands to
   `$crate::aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/", name))`.
   `env!` expands in the calling crate, so it sees the tool's `OUT_DIR`.
+- `max_entries(map, n)` passes through to `EbpfLoader::map_max_entries`.
+  aya 0.14 deprecates the old `set_max_entries`.
 
 ### pins: bpffs and pin-directory bookkeeping
 
@@ -339,6 +346,13 @@ These parts move:
   per-key access for good; after any other error, fall back for that call
   only.
 
+The calls take the map's fd, or any `&Map` of a batch-capable type, and
+not `&Ebpf` plus a map name. A map opened from its pin then uses the same
+path as one held by the loaded object. flood already works this way
+(`batch::policy_fd`, `read_policy(fd)` and friends), which lets its policy
+subcommands share the run loop's batch path. Its `map_fd`, which accepts
+the array and hash variants, moves too.
+
 The kill switch becomes a parameter, and flood keeps its `FLOOD_NO_BATCH`.
 Decoding returns typed keys and values (`read_unaligned` from the byte
 buffers), instead of each caller unpacking raw bytes. flood keeps its
@@ -377,7 +391,21 @@ Replaces these flood functions:
 - `verify_xdp_mode` and `xdp_mode_of`;
 - `ifindex_of`, `mtu_of` and `bond_slaves`;
 - the TC egress attach in `EgressHook::attach`, which tries TCX first and
-  falls back to netlink plus a clsact qdisc.
+  falls back to netlink plus a clsact qdisc. The hook keeps track of
+  whether it added the qdisc itself. aya's `qdisc_add_clsact` uses
+  `NLM_F_EXCL`, so a success means the qdisc is new. The hook then removes
+  it on detach and in `Drop`, using `tc qdisc del` because aya has no
+  qdisc delete. A clsact that was there before is left alone.
+
+`verify_xdp_mode` reports the mode the kernel actually used. It takes
+aya's `XdpMode` (aya 0.14 replaced `XdpFlags` with that enum), not flood's
+CLI enum.
+
+A note for the BPF side of any TCX program: under TCX, a return of 0 is
+`TCX_PASS`, which ends the hook chain and skips later programs and classic
+filters. A program that only observes returns `TC_ACT_UNSPEC`. flood's
+egress program does this. The constant goes in `bpfrig-ebpf`'s `consts`
+with that comment.
 
 flood is the only user today. These go in because the next XDP or TC tool
 would otherwise copy them. They sit behind a `net` feature so the guard
@@ -387,7 +415,6 @@ tools don't build them.
 
 | Item | Where it is today |
 |---|---|
-| `global_u32(&OFF_X)`: reads a loader-patched global with `read_volatile`, so the compiler cannot const-fold the placeholder zero | `cfg_u32` in unix-gc, vsock and btr. It returns `usize` in two of them and `u32` in btr; unify on `u32` |
 | `read_at::<T>(base, off)` and `deref_at(base, off)`, both over `bpf_probe_read_kernel` | unix-gc, vsock |
 | `bump(map, slot)` for a per-CPU u64 array | 4 copies, each hard-wired to its own `STATS`. flood's `bump_u64` already takes the map as a parameter |
 | `prev_verdict(ctx, hook_args)`: the previous LSM verdict, which comes after the hook's own arguments | 3 LSM programs |
@@ -398,6 +425,33 @@ tools don't build them.
 The kernel checks the `license` string before it allows GPL-only helpers
 (`bpf_probe_read_kernel`, `bpf_send_signal`). It is separate from the
 crates' own license. The macro defaults to today's `"GPL"`.
+
+Loader-patched globals need no helper. aya-ebpf 0.2 has `Global<T>`, and
+its `load()` is a `read_volatile`, which is exactly what each tool's
+`cfg_u32` does by hand:
+
+```rust
+#[unsafe(no_mangle)]
+static OFF_SOCKET_SK: Global<u32> = Global::new(0);
+
+let off = OFF_SOCKET_SK.load();
+```
+
+That replaces `cfg_u32` in unix-gc, vsock and btr, and settles its
+`usize`/`u32` split on `u32`. `Global` is `repr(transparent)`, so
+`override_global` patches it exactly as it patches a bare `u32` static.
+
+**aya-ebpf version.** `bpfrig-ebpf` depends on aya-ebpf 0.2, and each
+tool's BPF crate has to be on the same version. aya-ebpf's attribute
+macros (`#[map]`, `#[kprobe]`, `#[lsm]`) expand to `::aya_ebpf::` paths,
+so a tool cannot use a re-export from `bpfrig-ebpf`; it needs its own
+`aya-ebpf` dependency. If that dependency were 0.1 while `bpfrig-ebpf` is
+on 0.2, the `PerCpuArray<u64>` a tool declares would be a different type
+from the one `bump` accepts. On 2026-10-31 the four CVE BPF crates were
+checked against aya-ebpf 0.2 and aya-build 0.2 in scratch copies. All four
+build unchanged. The only new warning is `unused_unsafe` at deny-sctp's
+`ctx.arg()`, because `LsmContext::arg` is safe in 0.2. That check did not
+cover loading the objects through the verifier, which needs root.
 
 flood's packet parsing (`ptr_at`, `load`, and the L2/L3/L4 walkers) does
 not move. It has one user and is specific to its datapath. Revisit when a
@@ -413,6 +467,8 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
+- It wraps aya-build 0.2. Its `Package` / `Toolchain` / `build_ebpf` API
+  is the same as 0.1's, but 0.2.1 needs rustc 1.98.
 - It finds the crate and its `[[bin]]` target through the
   `cargo_metadata` crate, which aya-build already depends on, so the call
   only needs the package name.
@@ -463,6 +519,7 @@ without editing each tool's `build.rs`.
 4. flood's clock read ignores a `clock_gettime` failure; btr's checks for
    it.
 5. `cfg_u32` returns `usize` in two crates and `u32` in the third.
+   aya-ebpf 0.2's `Global<u32>` replaces it (see "bpfrig-ebpf").
 6. The map variant for a pinned map is chosen by hand at every call site
    (see "maps").
 
@@ -501,15 +558,20 @@ sequence.
 
 ## Constraints and decisions
 
-- **aya 0.14 is the minimum.** There is no 0.13 compatibility.
-  edge-xdp-flood adopts bpfrig together with its aya upgrade. Its comment
-  that 0.13.1 lacks `Map::from_map_data` no longer applies after the
-  upgrade.
+- **aya 0.14, aya-ebpf 0.2, aya-build 0.2 are the minimum.** There is no
+  0.13 compatibility. Every consumer is on aya 0.14 now; edge-xdp-flood
+  moved on 2026-10-27 and is also on aya-ebpf and aya-build 0.2. Its
+  comment at `flood/src/lib.rs:712` that aya has no `Map::from_map_data`
+  is out of date, and `open_policy` still picks `Map::HashMap` by hand.
+  `maps::open_pinned` replaces both.
 - **License: MIT OR Apache-2.0.** edge-xdp-flood is GPL-2.0-only and the
   CVE tools are MIT OR Apache-2.0. The dual permissive license works for
   both, whereas a GPL library would force the CVE tools to relicense.
-- **Edition 2024** (Rust 1.85 or newer). edge-xdp-flood's 2021-edition
-  crates can depend on it unchanged.
+- **Edition 2024.** edge-xdp-flood's 2021-edition crates can depend on it
+  unchanged. The minimum Rust versions come from aya rather than the
+  edition: 1.87 for `bpfrig` and `bpfrig-ebpf` (aya 0.14, aya-ebpf 0.2),
+  and 1.98 for `bpfrig-build` (aya-build 0.2.1). Each crate declares its
+  own `rust-version`.
 - **Errors: anyhow.** Every consumer is an anyhow binary, and much of the
   value is in the context strings ("is CONFIG_DEBUG_INFO_BTF set?").
   Revisit if a consumer needs to match on error kinds.
@@ -524,12 +586,16 @@ sequence.
 1. `bpfrig-build`, then `btf`, `ObjectLoader`, `pins`, `probes`, `lsm`,
    `maps`, `progs` and `host`. Migrate unix-gc and vsock first. They are
    the closest pair, so an API that fits one and not the other shows up
-   immediately.
-2. btr and deny-sctp. btr tests optional probes, several pinned maps, and
-   `Counters` across modes.
+   immediately. Adopting `bpfrig-build` moves a tool to aya-build 0.2.
+2. btr, deny-sctp, and edge-xdp-flood's use of the step-1 pieces:
+   `bpfrig-build`, `ObjectLoader`, `pins`, `maps` and `host`. btr tests
+   optional probes, several pinned maps, and `Counters` across modes.
+   flood is the only user of `Existing::ReplaceStale` and of a `PinTxn`
+   that is never committed, so it should migrate before `pins` is called
+   settled. Its aya upgrade, which used to block this, is done.
 3. `bpfrig-ebpf`, alongside each tool's BPF crate and its new `-common`
-   crate.
-4. `batch` and `net`, together with edge-xdp-flood's aya upgrade.
+   crate. The CVE BPF crates move to aya-ebpf 0.2 in the same step.
+4. `batch` and `net`, both flood-only for now.
 
 Check each migrated tool as root on a test machine. Run the full
 `--load` / `--check` / `--stats` / `--unload` cycle in every mode, and
