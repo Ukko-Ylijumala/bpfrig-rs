@@ -1,6 +1,6 @@
 [package]
 name = "bpfrig"
-description = "Shared loading plumbing for aya-based eBPF tools: BTF offsets, pins, kprobe tables, the bpf LSM, pinned maps"
+description = "Shared loading plumbing for aya-based eBPF tools: BTF offsets, pins, kprobe tables, the bpf LSM, pinned maps, batch map ops, XDP and TC"
 version.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -13,5 +13,11 @@ keywords = ["ebpf", "bpf", "aya"]
 [dependencies]
 anyhow.workspace = true
 aya.workspace = true
+libc.workspace = true
 nix.workspace = true
 strum.workspace = true
+
+[features]
+# XDP and TC helpers (interface facts, the XDP mode check, a TC hook that
+# cleans up its clsact qdisc). Only the network tools need them.
+net = []

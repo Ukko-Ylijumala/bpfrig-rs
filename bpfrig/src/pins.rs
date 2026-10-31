@@ -11,6 +11,11 @@
     removed again on drop unless [`PinTxn::commit`] was called, so a load
     that fails half-way (an attach error, a failed self-test, a panic)
     leaves nothing behind that looks loaded.
+
+    A resident tool pins its maps for its own subcommands instead, holds
+    the transaction for its whole run, and claims with
+    [`Existing::ReplaceStale`], so the pins of a run that was killed
+    without cleanup do not block the next one.
 */
 
 use std::fmt;
@@ -19,10 +24,12 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use aya::maps::MapData;
 use aya::programs::links::FdLink;
 use nix::mount::{MsFlags, mount};
+use nix::sys::statfs::{BPF_FS_MAGIC, statfs};
 
-use crate::host::mounts_of;
+use crate::maps::map_in_use;
 
 pub const BPFFS: &str = "/sys/fs/bpf";
 /** Prefix of a link pin: `link_<symbol>` for a kprobe, `link_<name>`
@@ -37,17 +44,36 @@ pub fn ensure_bpffs() -> Result<()> {
     ensure_bpffs_at(Path::new(BPFFS))
 }
 
-/** [`ensure_bpffs`] for another mount point. An unreadable mount table is
-    an error rather than a reason to mount anyway: stacking a second bpffs
-    over a populated one would hide every existing pin.
+/** [`ensure_bpffs`] for another path. A path already on a bpffs, the
+    mount point or a directory inside one, is used as it is: stacking a
+    second bpffs over a populated one would hide every existing pin. Any
+    other existing directory gets a bpffs mounted on it.
 */
 pub fn ensure_bpffs_at(path: &Path) -> Result<()> {
-    if mounts_of("bpf")?.iter().any(|mnt| mnt == path) {
+    let fs = statfs(path).with_context(|| format!("statfs {}", path.display()))?;
+    if fs.filesystem_type() == BPF_FS_MAGIC {
         return Ok(());
     }
     mount(Some("bpf"), path, Some("bpf"), MsFlags::empty(), None::<&str>)
         .with_context(|| format!("mounting bpffs at {}", path.display()))?;
     Ok(())
+}
+
+/// What [`PinDir::claim_with`] does with a pin directory that exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Existing {
+    /** Refuse: the tool is loaded. The pin-and-exit tools, whose pinned
+        links are what keeps them loaded ([`PinDir::claim`]).
+    */
+    Refuse,
+    /** Clear it unless something in it is live. A resident tool killed
+        without cleanup leaves its map pins behind, and those are stale
+        once no loaded program uses the maps. A map a loaded program still
+        uses belongs to a running instance, and anything that is not a map
+        (a pinned link or program) is live by definition: both refuse.
+        A map whose users cannot be listed counts as stale.
+    */
+    ReplaceStale,
 }
 
 /// One tool's pin directory, e.g. `/sys/fs/bpf/unix-gc-guard`.
@@ -133,12 +159,43 @@ impl PinDir {
         already exists (the tool is loaded), and create it.
     */
     pub fn claim(&self) -> Result<PinTxn<'_>> {
+        self.claim_with(Existing::Refuse)
+    }
+
+    /// [`claim`](Self::claim), with a choice of what an existing directory means.
+    pub fn claim_with(&self, existing: Existing) -> Result<PinTxn<'_>> {
         ensure_bpffs_at(&self.bpffs)?;
         if self.exists() {
-            bail!("already loaded: {self} exists (use --unload first)");
+            match existing {
+                Existing::Refuse => bail!("already loaded: {self} exists (use --unload first)"),
+                Existing::ReplaceStale => {
+                    self.refuse_live()?;
+                    self.remove_all()?;
+                }
+            }
         }
         fs::create_dir_all(&self.dir).with_context(|| format!("creating {self}"))?;
         Ok(PinTxn { dir: self, committed: false })
+    }
+
+    /// Fail when any pin in the directory is live (see [`Existing::ReplaceStale`]).
+    fn refuse_live(&self) -> Result<()> {
+        for name in self.files() {
+            let path = self.dir.join(&name);
+            let data = MapData::from_pin(&path).with_context(|| {
+                format!(
+                    "{} is not a pinned map, so it may be live (remove it by hand if not)",
+                    path.display()
+                )
+            })?;
+            if map_in_use(&data) == Some(true) {
+                bail!(
+                    "{self} belongs to a running instance: a loaded program still uses \
+                     its pinned map {name}"
+                );
+            }
+        }
+        Ok(())
     }
 }
 

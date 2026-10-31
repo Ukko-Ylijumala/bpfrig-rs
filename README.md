@@ -2,13 +2,14 @@
 
 Shared loading plumbing for [aya](https://aya-rs.dev)-based eBPF tools.
 It covers the parts every tool needs: struct offsets from kernel BTF, bpffs
-and pin bookkeeping, kprobe tables, `bpf` LSM checks, pinned maps, and the
-`build.rs` that compiles the BPF crate. Tools keep using aya directly;
+and pin bookkeeping, kprobe tables, `bpf` LSM checks, pinned maps, batch
+map syscalls, XDP and TC helpers, and the `build.rs` that compiles the BPF
+crate. Tools keep using aya directly;
 bpfrig fills the gaps around it.
 
 | Crate | Side | What it gives a tool |
 |---|---|---|
-| `bpfrig` | userspace | `btf::Layouts` offsets, `ObjectLoader`, `pins::PinDir` / `PinTxn`, `probes::attach_kprobes`, `lsm::*`, `maps::open_pinned` / `Counters`, `progs::*`, `host::*` |
+| `bpfrig` | userspace | `btf::Layouts` offsets, `ObjectLoader`, `pins::PinDir` / `PinTxn`, `probes::attach_kprobes`, `lsm::*`, `maps::open_pinned` / `map_in_use` / `Counters`, `batch::*`, `progs::*`, `host::*`; with the `net` feature, `net::*` (interface facts, XDP mode check, `TcHook`) |
 | `bpfrig-ebpf` | BPF, `no_std` | `read_at` / `deref_at`, `bump`, atomic increments, `prev_verdict`, `consts`, `program!()` |
 | `bpfrig-build` | `build.rs` | `build_ebpf("<pkg>")` over aya-build, with rebuild tracking and `SKIP_EBPF_BUILD` |
 
@@ -20,10 +21,10 @@ project. `bpfrig-build` needs rustc 1.98 (aya-build 0.2.1's floor).
 
 ```toml
 [dependencies]
-bpfrig = { git = "https://github.com/Ukko-Ylijumala/bpfrig-rs", tag = "v0.1.0" }
+bpfrig = { git = "https://github.com/Ukko-Ylijumala/bpfrig-rs", tag = "v0.1.1" }
 
 [build-dependencies]
-bpfrig-build = { git = "https://github.com/Ukko-Ylijumala/bpfrig-rs", tag = "v0.1.0" }
+bpfrig-build = { git = "https://github.com/Ukko-Ylijumala/bpfrig-rs", tag = "v0.1.1" }
 ```
 
 The tool's BPF crate depends on `bpfrig-ebpf` from the same tag, and on
@@ -54,6 +55,20 @@ let report = attach_kprobes(&mut ebpf, TRIPWIRE, &txn)?;
 pin_maps(&mut ebpf, &[("STATS", "stats")], &txn)?;
 // self-test here; returning early drops the transaction and removes every pin
 txn.commit();
+```
+
+A resident tool that pins maps for its own subcommands holds the
+transaction for its whole run instead, and never commits it:
+
+```rust
+let pins = PinDir::under(&bpffs, "my-tool");
+// clears a dead run's stale pins, refuses while a loaded program uses them
+let txn = pins.claim_with(Existing::ReplaceStale)?;
+let mut ebpf = ObjectLoader::new(bpfrig::embed!("my_tool_ebpf"))
+    .max_entries("FLOWS", flows)
+    .load()?;
+pin_maps(&mut ebpf, &[("POLICY", "policy")], &txn)?;
+// run; the pins go away on any exit, a panic unwind included
 ```
 
 On the BPF side:

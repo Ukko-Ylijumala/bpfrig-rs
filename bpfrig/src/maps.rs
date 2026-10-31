@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Mikko Tanner. All rights reserved.
 
 /*! Pinned maps: pinning them at load, opening them from a later
-    invocation, and the per-CPU counter array every tool keeps.
+    invocation, telling a live pin from a stale one, and the per-CPU
+    counter array every tool keeps.
 */
 
 use std::fmt::Display;
@@ -11,6 +12,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use aya::Ebpf;
 use aya::maps::{Map, MapData, MapError, PerCpuArray};
+use aya::programs::{ProgramError, loaded_programs};
+use nix::errno::Errno;
 
 use crate::pins::PinTxn;
 
@@ -26,10 +29,7 @@ where
     T: TryFrom<Map, Error = MapError>,
 {
     let shown = path.display();
-    if !path.exists() {
-        bail!("no pinned map at {shown} (not loaded?)");
-    }
-    let data = MapData::from_pin(path).with_context(|| format!("opening {shown}"))?;
+    let data = open_pinned_data(path)?;
     let map = Map::from_map_data(data).with_context(|| format!("{shown}: unsupported map type"))?;
     T::try_from(map).with_context(|| {
         format!(
@@ -37,6 +37,48 @@ where
              (unload and reload after an upgrade?)"
         )
     })
+}
+
+/** Open a pinned map without typing it yet, for a caller that inspects
+    it first (see [`map_in_use`]) and then picks its view, e.g. with
+    `Map::from_map_data`.
+*/
+pub fn open_pinned_data(path: &Path) -> Result<MapData> {
+    let shown = path.display();
+    if !path.exists() {
+        bail!("no pinned map at {shown} (not loaded?)");
+    }
+    MapData::from_pin(path).with_context(|| format!("opening {shown}"))
+}
+
+/** Does a loaded program still use this map? A pinned map outlives the
+    programs that used it, so a pin left by a process that died without
+    cleanup looks just like a live one; writing through it reports
+    success while nothing reads the map.
+
+    None means it could not be told: the map's info, the program list, or
+    a program's map ids were unreadable (without CAP_SYS_ADMIN the list is
+    a single error). Callers decide what that means for them; it never
+    passes for "nothing uses it".
+*/
+pub fn map_in_use(map: &MapData) -> Option<bool> {
+    let id = map.info().ok()?.id();
+    for prog in loaded_programs() {
+        let prog = match prog {
+            Ok(prog) => prog,
+            /* Unloaded between listing and opening: not one using `map`. */
+            Err(ProgramError::SyscallError(err))
+                if err.io_error.raw_os_error() == Some(Errno::ENOENT as i32) =>
+            {
+                continue;
+            }
+            Err(_) => return None,
+        };
+        if prog.map_ids().ok()??.contains(&id) {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 /** Pin maps of the loaded object, as `(map name, pin name)` pairs. The

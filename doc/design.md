@@ -2,9 +2,11 @@
 
 Status: the CVE-tool part of phase 1 is implemented as v0.1.0
 (2026-10-31): `bpfrig-build`, `bpfrig-ebpf`, and `bpfrig` except the
-flood-only pieces (`batch`, `net`, `map_in_use` and the replace-stale pin
-policy). The four CVE tools are ported onto it on a `bpfrig` branch in
-each repository, as git dependencies on the `v0.1.0` tag; see "Ports".
+flood-only pieces. The four CVE tools are ported onto it as git
+dependencies on the `v0.1.0` tag; see "Ports". The flood-only pieces
+(`batch`, `net`, `map_in_use` and the replace-stale pin policy) followed
+the same day as v0.1.1, with edge-xdp-flood ported onto them on a
+`bpfrig` branch.
 Proposal written 2026-10-22, revised 2026-10-31 after edge-xdp-flood moved
 to aya 0.14. Based on a read-through of the five aya-based tools listed
 under "Consumers". Each inventory entry names the functions it replaces.
@@ -194,9 +196,16 @@ impl PinTxn<'_> {
   already succeeded.
 - `claim` runs `ensure_bpffs`, refuses when the directory exists (the
   guard tools' "already loaded"), creates it and returns the transaction.
-  flood's behavior comes with its migration, as a second constructor or an
-  `Existing` policy argument: refuse if a loaded program still uses a
-  pinned map (`map_in_use`), otherwise clear the pins.
+  `claim_with(Existing::ReplaceStale)` is flood's version: it refuses if a
+  loaded program still uses a pinned map (`map_in_use`), or if the
+  directory holds anything that is not a map (a pinned link or program is
+  live by definition), and otherwise clears the pins. A map whose users
+  cannot be listed counts as stale, as flood had it.
+- `ensure_bpffs` decides by `statfs` whether the path is already on a
+  bpffs, the mount point or a directory inside one, rather than by
+  looking the path up in `/proc/self/mounts`. flood's `--bpffs` may name a
+  directory inside `/sys/fs/bpf`, which is not a mount point; the mounts
+  lookup would have stacked a new bpffs on it.
 - The guard tools call `commit()` after the self-test passes. flood holds
   the transaction for the whole of `run` and never commits it, so its pins
   are removed on any exit, including a panic unwind. That is what
@@ -301,6 +310,7 @@ pub fn open_pinned<T>(path: &Path) -> Result<T>
 where
     T: TryFrom<Map, Error = MapError>;
 
+pub fn open_pinned_data(path: &Path) -> Result<MapData>;
 pub fn pin_maps(ebpf: &mut Ebpf, maps: &[(&str, &str)], pins: &PinTxn) -> Result<()>;
 pub fn map_in_use(map: &MapData) -> Option<bool>;
 
@@ -320,6 +330,12 @@ impl<S: Copy + Display + Into<u32>> Counters<S> {
   (`Map::LruHashMap(data)`), and aya checks only the key and value sizes
   against the kernel, so a wrong variant is not caught. The error keeps
   the "(not loaded?)" hint.
+- `open_pinned_data` is the untyped first half, for a caller that checks
+  `map_in_use` before picking its view: flood's `open_policy` refuses a
+  stale pin, then takes `Map::from_map_data` for its batch helpers.
+- `map_in_use` returns None when it cannot tell (no CAP_SYS_ADMIN, an
+  unreadable program list). It never passes for "nothing uses it"; the
+  caller decides what None means.
 - `moved` is the self-test step that all three guard tools write by hand:
   read a slot, run the trigger, read the slot again, then return the
   difference and the trigger's result. The triggers stay in the tools.
@@ -344,31 +360,49 @@ pub fn live_programs(names: &[&str]) -> LivePrograms;
 Replaces the generic core of flood's `batch.rs`. aya 0.14 still has no
 batch API.
 
-These parts move:
+```rust
+pub enum Lookup { Read, Drain }        // LOOKUP_BATCH, LOOKUP_AND_DELETE_BATCH
 
-- the `BPF_MAP_LOOKUP_BATCH` / `LOOKUP_AND_DELETE_BATCH` loop. It resumes
-  from the kernel's bucket token, so unlike a `GET_NEXT_KEY` walk it
-  finishes even while an LRU map churns;
-- chunk growth on ENOSPC;
-- the per-thread reusable buffers;
-- `UPDATE_BATCH` and `DELETE_BATCH`;
-- the per-CPU value stride;
-- the fallback rule: when the kernel says batch ops are unsupported, use
-  per-key access for good; after any other error, fall back for that call
-  only.
+pub fn map_fd(map: &Map) -> io::Result<BorrowedFd<'_>>;
+pub fn possible_cpus() -> io::Result<usize>;
+pub const fn percpu_slot<V>() -> usize;          // round_up(size_of::<V>(), 8)
+pub fn pod_at<T: Pod>(buf: &[u8], i: usize) -> T;
 
-The calls take the map's fd, or any `&Map` of a batch-capable type, and
-not `&Ebpf` plus a map name. A map opened from its pin then uses the same
-path as one held by the loaded object. flood already works this way
-(`batch::policy_fd`, `read_policy(fd)` and friends), which lets its policy
-subcommands share the run loop's batch path. Its `map_fd`, which accepts
-the array and hash variants, moves too.
+pub fn lookup_raw(fd: BorrowedFd<'_>, op: Lookup, key_size: usize, stride: usize,
+                  visit: impl FnMut(&[u8], &[u8], usize)) -> io::Result<()>;
+pub fn lookup<K: Pod, V: Pod>(fd: BorrowedFd<'_>, op: Lookup,
+                              f: impl FnMut(K, V)) -> io::Result<()>;
+pub fn update<K: Pod, V: Pod>(fd: BorrowedFd<'_>, keys: &[K], vals: &[V]) -> io::Result<usize>;
+pub fn delete<K: Pod>(fd: BorrowedFd<'_>, keys: &[K]) -> io::Result<usize>;
 
-The kill switch becomes a parameter, and flood keeps its `FLOOD_NO_BATCH`.
-Decoding returns typed keys and values (`read_unaligned` from the byte
-buffers), instead of each caller unpacking raw bytes. flood keeps its
-decoders for its own types, and its `walk_cap` policy for the per-key
-fallback.
+pub struct Gate { .. }
+impl Gate {
+    pub const fn new() -> Self;
+    pub fn enabled(&self) -> bool;
+    pub fn fallback(&self, err: &io::Error) -> Fallback;
+}
+pub enum Fallback { Unsupported { first: bool }, Transient { first: bool } }
+```
+
+- The lookup loop resumes from the kernel's bucket token, so unlike a
+  `GET_NEXT_KEY` walk it finishes even while an LRU map churns. It grows
+  its chunk on ENOSPC and keeps per-thread buffers across calls.
+- `update` returns the partial count on E2BIG/ENOMEM (map full), and
+  `delete` skips a key that is already gone and carries on after it.
+- The calls take the map's fd, not `&Ebpf` plus a map name, so a map
+  opened from its pin goes the same way as one the loaded object holds.
+- `Gate` holds the fallback rule: when the kernel says batch ops are
+  unsupported, use per-key access for good; after any other error, fall
+  back for that call only. It returns what happened instead of logging,
+  with `first` set once per kind, so the caller logs in its own way.
+  bpfrig has no `log` dependency. The kill switch stays with the caller:
+  flood keeps `FLOOD_NO_BATCH` next to `Gate::enabled`.
+- `lookup_raw` hands over raw chunk bytes, because flood's per-CPU folds
+  read slots of a constant size straight out of the buffer, which is what
+  lets them compile without bounds checks. `pod_at` replaces the hand
+  `read_unaligned` calls for keys. `lookup` is the typed form for plain
+  maps. flood keeps its decoders for its own types and its `walk_cap`
+  policy for the per-key fallback.
 
 ### host: small kernel facts
 
@@ -408,22 +442,46 @@ Replaces these flood functions:
 
 - `verify_xdp_mode` and `xdp_mode_of`;
 - `ifindex_of`, `mtu_of` and `bond_slaves`;
-- the TC egress attach in `EgressHook::attach`, which tries TCX first and
-  falls back to netlink plus a clsact qdisc. The hook keeps track of
-  whether it added the qdisc itself. aya's `qdisc_add_clsact` uses
-  `NLM_F_EXCL`, so a success means the qdisc is new. The hook then removes
-  it on detach and in `Drop`, using `tc qdisc del` because aya has no
-  qdisc delete. A clsact that was there before is left alone.
+- the TC attach and clsact bookkeeping of `EgressHook`.
 
-`verify_xdp_mode` reports the mode the kernel actually used. It takes
-aya's `XdpMode` (aya 0.14 replaced `XdpFlags` with that enum), not flood's
-CLI enum.
+```rust
+pub fn bond_slaves(iface: &str) -> Vec<String>;
+pub fn ifindex_of(iface: &str) -> Option<u32>;
+pub fn mtu_of(iface: &str) -> Option<u32>;
+
+pub enum XdpAttach { Native, Generic, Unconfirmed }
+pub fn verify_xdp_mode(iface: &str) -> XdpAttach;
+
+pub struct TcHook { .. }
+impl TcHook {
+    pub fn new(iface: &str, direction: TcAttachType) -> Self;
+    pub fn attached(&self) -> bool;
+    pub fn attach(&mut self, prog: &mut SchedClassifier) -> Result<()>;
+    pub fn detach(&mut self, prog: &mut SchedClassifier) -> Result<()>;
+    pub fn release_qdisc(&mut self) -> Result<bool>;
+}
+```
+
+- `verify_xdp_mode` reports the mode the kernel actually used, from the
+  mode word of `ip link show`. It takes no expected mode: the caller
+  compares, since a positive `Generic` is fatal only for a native attach.
+- `TcHook::attach` tries aya's default first (TCX on 6.6+) and falls back
+  to netlink plus a clsact qdisc. aya's `qdisc_add_clsact` uses
+  `NLM_F_EXCL`, so a success means the qdisc is new and the hook's to
+  remove. `release_qdisc` removes it with `tc qdisc del`, because aya has
+  no qdisc delete; it returns whether it did, so the caller can log, and
+  `Drop` does it silently as a backstop. A clsact that was there before is
+  left alone.
+- One fix on the way in: flood recorded the added qdisc only after the
+  netlink attach succeeded, so a failed fallback left the clsact behind.
+  The hook records it as soon as it is added, and flood now releases it
+  when the attach fails.
 
 A note for the BPF side of any TCX program: under TCX, a return of 0 is
-`TCX_PASS`, which ends the hook chain and skips later programs and classic
-filters. A program that only observes returns `TC_ACT_UNSPEC`. flood's
-egress program does this. The constant goes in `bpfrig-ebpf`'s `consts`
-with that comment.
+`TCX_PASS`, which ends the hook chain and skips later programs and
+classic filters. A program that only observes returns `TC_ACT_UNSPEC`.
+flood's egress program does this. The constant is in `bpfrig-ebpf`'s
+`consts`, with that comment.
 
 flood is the only user today. These go in because the next XDP or TC tool
 would otherwise copy them. They sit behind a `net` feature so the guard
@@ -539,8 +597,10 @@ without editing each tool's `build.rs`.
    See "probes" for the unified table.
 2. `btf.rs` truncates bitfield offsets (see "btf").
 3. When `/proc/self/mounts` cannot be read, deny-sctp's `ensure_bpffs`
-   tries to mount bpffs anyway, while the others fail. bpfrig fails:
-   mounting a second bpffs over a populated one would hide every pin.
+   tries to mount bpffs anyway, while the others fail. bpfrig asks
+   `statfs` instead, which needs no mount table and also accepts a
+   directory inside a bpffs; mounting a second bpffs over a populated one
+   would hide every pin.
 4. flood's clock read ignores a `clock_gettime` failure; btr's checks for
    it.
 5. `cfg_u32` returns `usize` in two crates and `u32` in the third.
@@ -586,9 +646,9 @@ sequence.
 - **aya 0.14, aya-ebpf 0.2, aya-build 0.2 are the minimum.** There is no
   0.13 compatibility. Every consumer is on aya 0.14 now; edge-xdp-flood
   moved on 2026-10-27 and is also on aya-ebpf and aya-build 0.2. Its
-  comment at `flood/src/lib.rs:712` that aya has no `Map::from_map_data`
-  is out of date, and `open_policy` still picks `Map::HashMap` by hand.
-  `maps::open_pinned` replaces both.
+  comment that aya has no `Map::from_map_data` was out of date, and
+  `open_policy` picked `Map::HashMap` by hand; the port replaces both
+  (see "maps").
 - **License: MIT OR Apache-2.0.** edge-xdp-flood is GPL-2.0-only and the
   CVE tools are MIT OR Apache-2.0. The dual permissive license works for
   both, whereas a GPL library would force the CVE tools to relicense.
@@ -620,7 +680,7 @@ sequence.
    settled. Its aya upgrade, which used to block this, is done.
 3. `bpfrig-ebpf`, alongside each tool's BPF crate and its new `-common`
    crate. The CVE BPF crates move to aya-ebpf 0.2 in the same step.
-4. `batch` and `net`, both flood-only for now.
+4. `batch` and `net`, both flood-only for now. Done with flood's port.
 
 Check each migrated tool as root on a test machine. Run the full
 `--load` / `--check` / `--stats` / `--unload` cycle in every mode, and
@@ -651,6 +711,25 @@ copies; after the tag the same ports went into the repositories, on a
   the eBPF build, and one in `bpfrig` does not.
 - Not done: loading through the verifier and the root-only cycle above.
 
+edge-xdp-flood followed on its own `bpfrig` branch, against v0.1.1:
+
+- `build.rs` is `bpfrig_build::build_ebpf("flood-ebpf")`; its hand-written
+  `flood-common` rerun line and `SKIP_EBPF_BUILD` stub are gone.
+- `run` claims `<bpffs>/flood` with `Existing::ReplaceStale` before it
+  touches the NIC and holds the `PinTxn` for the whole run (it replaces
+  `PinGuard`); the three map pins go through `pin_maps`. The object loads
+  through `ObjectLoader` with `max_entries("SYNACK", ..)`.
+- `open_policy` and the pinned config and allow maps open by the kernel's
+  map type (`open_pinned_data` + `Map::from_map_data`, `open_pinned`).
+- `batch.rs` keeps its readers and per-CPU decoders over `bpfrig::batch`;
+  `EgressHook` keeps its protect-mode policy and logging over `TcHook`;
+  the interface helpers come from `bpfrig::net`; the clock reads are
+  `host::ktime_ns()?`, so a `clock_gettime` failure is an error now.
+- The BPF crate uses `program!()` and `consts::TC_ACT_UNSPEC`. Its
+  `.text`, `xdp`, `classifier`, `license` and `maps` sections are
+  byte-identical to master's build.
+- flood's 79 tests pass. Not done: a root run on a test machine.
+
 Behavior changes a real port brings, on top of the open questions:
 
 - unix-gc's probes stay optional, but a missing one is now listed in the
@@ -667,7 +746,8 @@ Behavior changes a real port brings, on top of the open questions:
 1. Under the unified table, unix-gc's probes become `required`. `unix_gc`
    and the `unix_*_recvmsg` family exist on every 6.x kernel checked, so
    unix-gc would start failing where it now skips. Is that acceptable?
-2. Should the `net` helpers go behind a feature or into their own crate?
+2. ~~Should the `net` helpers go behind a feature or into their own
+   crate?~~ A feature, `net`, which flood enables.
 3. Should the default BPF license string stay `"GPL"`, or become
    `"Dual MIT/GPL"` to match the crates' own license?
 4. The four `build-dist.sh` scripts differ only in the binary name. Should
