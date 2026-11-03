@@ -17,5 +17,5 @@ aya-build = "0.2"
 aya-ebpf = "0.2"
 cargo_metadata = { version = "0.23", default-features = false }
 libc = "0.2"
-nix = { version = "0.30", features = ["fs", "mount", "time", "user"] }
+nix = { version = "0.31", features = ["fs", "mount", "time", "user"] }
 strum = { version = "0.27", features = ["derive"] }
