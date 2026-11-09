@@ -386,7 +386,10 @@ pub enum Fallback { Unsupported { first: bool }, Transient { first: bool } }
 
 - The lookup loop resumes from the kernel's bucket token, so unlike a
   `GET_NEXT_KEY` walk it finishes even while an LRU map churns. It grows
-  its chunk on ENOSPC and keeps per-thread buffers across calls.
+  its chunk on ENOSPC and keeps per-thread buffers across calls. A call
+  asks for 4096 entries, or for as many as fit an 8 MiB value buffer: a
+  per-CPU map of large values (flood's `UDP_SPORT`, 8 KiB a CPU) would
+  otherwise get hundreds of megabytes for a few dozen entries.
 - `update` returns the partial count on E2BIG/ENOMEM (map full), and
   `delete` skips a key that is already gone and carries on after it.
 - The calls take the map's fd, not `&Ebpf` plus a map name, so a map

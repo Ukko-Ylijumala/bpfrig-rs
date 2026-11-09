@@ -4,10 +4,11 @@
     updates and deletes in a few syscalls. aya has no batch API, so these
     drive the syscall directly on the map's fd.
 
-    One lookup call returns up to 4096 entries, per-CPU values included,
-    where a per-key walk costs a syscall per key (two for a hash map, which
-    also needs `GET_NEXT_KEY`). For a hash map the resume token is a
-    bucket index, so the walk only ever moves forward: unlike a
+    One lookup call returns up to 4096 entries, per-CPU values included
+    (fewer when the values are large: the value buffer starts within
+    8 MiB), where a per-key walk costs a syscall per key (two for a hash
+    map, which also needs `GET_NEXT_KEY`). For a hash map the resume token
+    is a bucket index, so the walk only ever moves forward: unlike a
     `GET_NEXT_KEY` walk it cannot restart from the first bucket when the
     key it stands on is evicted, and it finishes however hard an LRU map
     churns.
@@ -44,6 +45,15 @@ const ENOTSUPP: i32 = 524;
 const CHUNK: u32 = 4096;
 const CHUNK_MAX: u32 = 1 << 16;
 
+/** The most bytes a lookup's value buffer starts at: a call asks for fewer
+    than `CHUNK` entries when that many would not fit. A per-CPU value is
+    its size times the CPU count, so large values add up fast: an 8 KiB
+    counter block on 16 CPUs is 128 KiB an entry, and 4096 of those were a
+    512 MiB buffer, zero-filled and kept, to read a map of a few dozen
+    entries. Growth on ENOSPC is not bound by it: a hash bucket has to fit.
+*/
+const VALUES_BUDGET: usize = 8 << 20;
+
 const BPF_MAP_LOOKUP_BATCH: c_long = 24;
 const BPF_MAP_LOOKUP_AND_DELETE_BATCH: c_long = 25;
 const BPF_MAP_UPDATE_BATCH: c_long = 26;
@@ -65,10 +75,12 @@ struct BatchAttr {
 
 thread_local! {
     /** The lookup buffers, kept (grow-only) across calls on one thread. A
-        full chunk of a per-CPU map is 4096 x value slot x nCPU, megabytes
-        on a big host, and would otherwise be allocated and zeroed on every
-        call. Only the entries the kernel reports are read back, so a stale
-        tail is harmless. A `visit` callback must not start another lookup.
+        full chunk of a per-CPU map is up to 4096 x value slot x nCPU,
+        megabytes on a big host (`VALUES_BUDGET` at most, short of an
+        oversized hash bucket), and would otherwise be allocated and zeroed
+        on every call. Only the entries the kernel reports are read back,
+        so a stale tail is harmless. A `visit` callback must not start
+        another lookup.
     */
     static BUFS: RefCell<(Vec<u8>, Vec<u8>)> = const { RefCell::new((Vec::new(), Vec::new())) };
 }
@@ -242,6 +254,24 @@ pub fn lookup<K: Pod, V: Pod>(
     })
 }
 
+/** Entries the first call of a lookup asks for, given the bytes one
+    entry's value takes: `CHUNK`, or as many as fit `VALUES_BUDGET`, and
+    always at least one.
+*/
+const fn first_chunk(stride: usize) -> u32 {
+    if stride == 0 {
+        return CHUNK;
+    }
+    let fit = VALUES_BUDGET / stride;
+    if fit >= CHUNK as usize {
+        CHUNK
+    } else if fit == 0 {
+        1
+    } else {
+        fit as u32
+    }
+}
+
 /// The loop of [`lookup_raw`], over the caller's reusable buffers.
 fn lookup_in(
     fd: BorrowedFd<'_>,
@@ -252,7 +282,7 @@ fn lookup_in(
     vals: &mut Vec<u8>,
     visit: &mut impl FnMut(&[u8], &[u8], usize),
 ) -> io::Result<()> {
-    let mut chunk = CHUNK;
+    let mut chunk = first_chunk(stride);
     ensure_len(keys, chunk as usize * key_size);
     ensure_len(vals, chunk as usize * stride);
     /* Opaque resume tokens. The generic implementation (arrays) stores a
@@ -400,6 +430,23 @@ mod tests {
         assert!(!gate.enabled());
         let einval = io::Error::from_raw_os_error(libc::EINVAL);
         assert!(!gate.fallback(&einval).first());
+    }
+
+    /** Small values get the full chunk; large per-CPU ones only as many
+        entries as the budget holds, and never none.
+    */
+    #[test]
+    fn first_chunk_fits_the_value_budget() {
+        /* A 32-byte value on 16 and on 64 CPUs: the full chunk. */
+        assert_eq!(first_chunk(32 * 16), CHUNK);
+        assert_eq!(first_chunk(32 * 64), CHUNK);
+        /* 1024 u64 counters per entry: 64 entries on 16 CPUs, 21 on 48. */
+        assert_eq!(first_chunk(8 * 1024 * 16), 64);
+        assert_eq!(first_chunk(8 * 1024 * 48), 21);
+        assert!(first_chunk(8 * 1024 * 48) as usize * 8 * 1024 * 48 <= VALUES_BUDGET);
+        /* A value over the whole budget is still read, one at a time. */
+        assert_eq!(first_chunk(VALUES_BUDGET + 1), 1);
+        assert_eq!(first_chunk(0), CHUNK);
     }
 
     #[test]
