@@ -53,7 +53,7 @@ let mut ebpf = ObjectLoader::new(bpfrig::embed!("my_tool_ebpf"))
     .load()?;
 let report = attach_kprobes(&mut ebpf, TRIPWIRE, &txn)?;
 pin_maps(&mut ebpf, &[("STATS", "stats")], &txn)?;
-// self-test here; returning early drops the transaction and removes every pin
+// self-test here; returning early drops the transaction and removes its pins
 txn.commit();
 ```
 

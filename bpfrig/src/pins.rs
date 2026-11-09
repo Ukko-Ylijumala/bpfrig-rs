@@ -7,10 +7,12 @@
     maps a later invocation reads back. Removing a pinned link is what
     detaches its program, so `--unload` is "remove the directory".
 
-    Loading goes through a [`PinTxn`]: every pin made while it is held is
+    Loading goes through a [`PinTxn`]: every pin made through it is
     removed again on drop unless [`PinTxn::commit`] was called, so a load
     that fails half-way (an attach error, a failed self-test, a panic)
-    leaves nothing behind that looks loaded.
+    leaves nothing behind that looks loaded. It removes its own pins only:
+    a second load that raced the first one into the directory and then
+    failed must not take the first one's pins with it.
 
     A resident tool pins its maps for its own subcommands instead, holds
     the transaction for its whole run, and claims with
@@ -18,6 +20,8 @@
     without cleanup do not block the next one.
 */
 
+use std::cell::RefCell;
+use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
 use std::ops::Deref;
@@ -175,7 +179,7 @@ impl PinDir {
             }
         }
         fs::create_dir_all(&self.dir).with_context(|| format!("creating {self}"))?;
-        Ok(PinTxn { dir: self, committed: false })
+        Ok(PinTxn { dir: self, made: RefCell::default(), committed: false })
     }
 
     /// Fail when any pin in the directory is live (see [`Existing::ReplaceStale`]).
@@ -206,7 +210,16 @@ impl fmt::Display for PinDir {
 }
 
 /** A load in progress. Dropping it without [`commit`](Self::commit)
-    removes every pin in the directory, and the directory itself.
+    removes every pin made through it, and the directory once it is empty.
+
+    Only its own pins: the claim is a check, not a lock, so two loads
+    started together can both hold a transaction on the same directory.
+    The one that loses (its attach or its pin fails) then leaves the
+    winner's pins alone; removing "everything in the directory" would
+    unload a pin-and-exit tool, or strand a resident one's subcommands.
+    A pin made by hand at a path from the `PinDir` is not tracked, so
+    every pin of a load goes through [`pin_with`](Self::pin_with) or a
+    helper built on it (`pin_link`, `maps::pin_maps`).
 
     A tool that pins and exits commits once its self-test has passed. A
     resident tool can hold the transaction for its whole run and never
@@ -216,6 +229,8 @@ impl fmt::Display for PinDir {
 */
 pub struct PinTxn<'a> {
     dir: &'a PinDir,
+    /// The pins this transaction made, in order.
+    made: RefCell<Vec<PathBuf>>,
     committed: bool,
 }
 
@@ -225,11 +240,23 @@ impl PinTxn<'_> {
         self.committed = true;
     }
 
+    /** Make the pin `<name>` with `pin`, which gets the path, and record
+        it as this transaction's. A pin that fails is not recorded: a
+        path that already exists (EEXIST) is someone else's pin.
+    */
+    pub fn pin_with<E>(&self, name: &str, pin: impl FnOnce(&Path) -> Result<(), E>) -> Result<PathBuf>
+    where
+        E: StdError + Send + Sync + 'static,
+    {
+        let path = self.dir.path(name)?;
+        pin(&path).with_context(|| format!("pinning {}", path.display()))?;
+        self.made.borrow_mut().push(path.clone());
+        Ok(path)
+    }
+
     /// Pin a link as `<name>` and return the path.
     pub fn pin_link(&self, link: FdLink, name: &str) -> Result<PathBuf> {
-        let path = self.dir.path(name)?;
-        link.pin(&path).with_context(|| format!("pinning {}", path.display()))?;
-        Ok(path)
+        self.pin_with(name, |path| link.pin(path).map(drop))
     }
 }
 
@@ -243,9 +270,14 @@ impl Deref for PinTxn<'_> {
 
 impl Drop for PinTxn<'_> {
     fn drop(&mut self) {
-        if !self.committed {
-            let _ = self.dir.remove_all();
+        if self.committed {
+            return;
         }
+        for path in self.made.get_mut().drain(..).rev() {
+            let _ = fs::remove_file(path);
+        }
+        /* Fails, as it should, while someone else's pins are in it. */
+        let _ = fs::remove_dir(&self.dir.dir);
     }
 }
 
@@ -288,28 +320,57 @@ mod tests {
         assert!(!pins.has("link.x"));
     }
 
-    /** The transaction removes what was pinned unless committed. A plain
-        directory stands in for bpffs; nothing here needs the real thing
-        except `claim`, so the transaction is built by hand.
-    */
+    /// A transaction on `pins` as `claim` returns it, without the bpffs
+    /// mount: a plain directory stands in, and a file write for a pin.
+    fn txn_on(pins: &PinDir) -> PinTxn<'_> {
+        fs::create_dir_all(pins.dir()).unwrap();
+        PinTxn { dir: pins, made: RefCell::default(), committed: false }
+    }
+
+    fn write_pin(txn: &PinTxn, name: &str) -> Result<PathBuf> {
+        txn.pin_with(name, |path| fs::write(path, b""))
+    }
+
+    /// The transaction removes what it pinned unless committed, and the
+    /// directory with it.
     #[test]
     fn uncommitted_transaction_removes_its_pins() {
         let root = env::temp_dir().join(format!("bpfrig-pins-{}", process::id()));
         let pins = PinDir::under(&root, "tool");
         for commit in [false, true] {
-            fs::create_dir_all(pins.dir()).unwrap();
-            fs::write(pins.path("stats").unwrap(), b"").unwrap();
-            let txn = PinTxn { dir: &pins, committed: false };
+            let txn = txn_on(&pins);
+            write_pin(&txn, "stats").unwrap();
             assert_eq!(txn.files(), vec!["stats".to_string()]);
             if commit {
                 txn.commit();
-                assert!(pins.exists());
+                assert!(pins.has("stats"));
             } else {
                 drop(txn);
                 assert!(!pins.exists());
             }
         }
         pins.remove_all().unwrap();
+        let _ = fs::remove_dir(&root);
+    }
+
+    /** Two loads raced into one directory: the loser's unwind removes
+        its own pins and leaves the winner's, and the directory, in place.
+        A pin it failed to make (the winner's name) was never its own.
+    */
+    #[test]
+    fn a_failed_load_leaves_another_loads_pins() {
+        let root = env::temp_dir().join(format!("bpfrig-pins-race-{}", process::id()));
+        let pins = PinDir::under(&root, "tool");
+        let winner = txn_on(&pins);
+        let loser = txn_on(&pins);
+        write_pin(&winner, "policy").unwrap();
+        write_pin(&loser, "scratch").unwrap();
+        let taken = loser.pin_with("policy", |path| fs::File::create_new(path).map(drop));
+        assert!(taken.is_err());
+        drop(loser);
+        assert_eq!(pins.files(), vec!["policy".to_string()]);
+        drop(winner);
+        assert!(!pins.exists());
         let _ = fs::remove_dir(&root);
     }
 }

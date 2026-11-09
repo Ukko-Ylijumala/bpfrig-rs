@@ -87,11 +87,9 @@ pub fn map_in_use(map: &MapData) -> Option<bool> {
 */
 pub fn pin_maps(ebpf: &mut Ebpf, maps: &[(&str, &str)], pins: &PinTxn) -> Result<()> {
     for (name, pin) in maps {
-        let path = pins.path(pin)?;
-        ebpf.map_mut(name)
-            .with_context(|| format!("map {name} missing from the object"))?
-            .pin(&path)
-            .with_context(|| format!("pinning {name} at {}", path.display()))?;
+        let map =
+            ebpf.map_mut(name).with_context(|| format!("map {name} missing from the object"))?;
+        pins.pin_with(pin, |path| map.pin(path)).with_context(|| format!("map {name}"))?;
     }
     Ok(())
 }

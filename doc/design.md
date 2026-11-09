@@ -176,15 +176,25 @@ impl PinDir {
     pub fn claim(&self) -> Result<PinTxn<'_>>;
 }
 
-/// Removes every pin in the directory on drop unless committed.
-/// Derefs to the PinDir.
+/// Removes the pins made through it on drop unless committed, and the
+/// directory once empty. Derefs to the PinDir.
 pub struct PinTxn<'a> { .. }
 
 impl PinTxn<'_> {
     pub fn commit(self);
+    pub fn pin_with<E>(&self, name: &str, pin: impl FnOnce(&Path) -> Result<(), E>)
+        -> Result<PathBuf>;                           // every pin goes through here
     pub fn pin_link(&self, link: FdLink, name: &str) -> Result<PathBuf>;
 }
 ```
+
+- A transaction removes its own pins only. The claim is a check, not a
+  lock: two loads started together can both pass it, and the one whose
+  attach or pin then fails must leave the other's pins alone. (It used to
+  remove everything in the directory, which let a failed second
+  `flood run` take a starting first run's pins, and would have unloaded a
+  guard tool the same way.) `pin_link` and `maps::pin_maps` record through
+  `pin_with`; a pin made by hand at a `PinDir` path is not tracked.
 
 - `PinDir::new` panics rather than returning an error, because the tool
   name is always a constant: an invalid one is a bug. Pin names stay
