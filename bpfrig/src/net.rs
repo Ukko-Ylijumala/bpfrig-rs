@@ -1,8 +1,10 @@
 // Copyright (c) 2026 Mikko Tanner. All rights reserved.
 
 /*! XDP and TC helpers (feature `net`): interface facts from sysfs, the
-    XDP mode an interface actually runs, and a TC hook that leaves the
-    interface's qdisc setup as it found it.
+    XDP mode an interface actually runs, a TC hook that leaves the
+    interface's qdisc setup as it found it, and the two steps of an
+    attachment that outlives its process: pinning the link of a fresh
+    attach, and giving a pinned link the program of a new load.
 
     A note for the BPF side of a TCX program: under TCX a return of 0 is
     `TCX_PASS`, which ends the hook chain and skips later programs and
@@ -10,15 +12,24 @@
     (in `bpfrig_ebpf::consts`).
 */
 
+use std::fmt::Debug;
 use std::fs;
+use std::io::ErrorKind;
 use std::mem;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
-use aya::programs::SchedClassifier;
+use anyhow::{Context, Result, anyhow, bail};
+use aya::programs::links::{FdLink, PinnedLink};
 use aya::programs::tc::{
-    NlOptions, SchedClassifierLinkId, TcAttachOptions, TcAttachType, qdisc_add_clsact,
+    NlOptions, SchedClassifierLink, SchedClassifierLinkId, TcAttachOptions, TcAttachType,
+    qdisc_add_clsact,
 };
+use aya::programs::xdp::{XdpLink, XdpLinkId};
+use aya::programs::{ProgramError, SchedClassifier, Xdp};
+use nix::errno::Errno;
+
+use crate::pins::PinTxn;
 
 /// One attribute of an interface from `/sys/class/net/<iface>/<attr>`.
 fn sysfs_net(iface: &str, attr: &str) -> Option<String> {
@@ -84,6 +95,82 @@ fn xdp_mode_of(dump: &str) -> XdpAttach {
     XdpAttach::Unconfirmed
 }
 
+/// What a pinned link did with the program of a new load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkSwap {
+    /** The link runs the new program. The kernel replaced it in one step:
+        no packet passed without a program, none ran both.
+    */
+    Swapped,
+    /** The link is attached to nothing: its interface was deleted (and
+        perhaps made again under the same name, which is another device).
+        The kernel answers ENOLINK, and the link never attaches again.
+        Nothing was changed: the caller removes the pin and attaches fresh.
+    */
+    Defunct,
+}
+
+/** True for the id of an attach aya made through netlink instead of a bpf
+    link. aya has no accessor for the kind, and the one conversion that
+    tells (`FdLink::try_from`) consumes the link and, for a netlink one,
+    drops it without detaching: the program would stay on the interface
+    with nothing owning it. The id's `Debug` names the variant, so it is
+    read from there, before the link leaves its program.
+*/
+fn is_netlink(id: &impl Debug) -> bool {
+    format!("{id:?}").contains("NlLinkId")
+}
+
+/// An attach that failed because the link's interface is gone.
+fn is_defunct(err: &ProgramError) -> bool {
+    matches!(err, ProgramError::SyscallError(sys)
+        if sys.io_error.raw_os_error() == Some(Errno::ENOLINK as i32))
+}
+
+/// The link behind a pin, opened for a swap. The pin stays.
+fn open_pinned_link(pin: &Path) -> Result<FdLink> {
+    let link = PinnedLink::from_pin(pin)
+        .with_context(|| format!("opening the pinned link {}", pin.display()))?;
+    Ok(FdLink::from(link))
+}
+
+/** Take the link of an XDP attach out of `prog` and pin it as `<name>`:
+    from then on the pin alone keeps the program attached, and dropping
+    `prog` with its `Ebpf` detaches nothing. `id` is what `Xdp::attach`
+    returned. An attach aya had to make through netlink (the kernel
+    refused a bpf link with EINVAL) has no link to pin: that is an error,
+    and the attach stays with `prog`, to end with it as usual. When the pin
+    itself fails the link is gone, and the program detached.
+*/
+pub fn pin_xdp_link(prog: &mut Xdp, id: XdpLinkId, pins: &PinTxn, name: &str) -> Result<PathBuf> {
+    if is_netlink(&id) {
+        bail!("XDP was attached through netlink (no bpf link from this kernel): nothing to pin");
+    }
+    let link = prog.take_link(id).context("taking the XDP link from its program")?;
+    let link = FdLink::try_from(link).map_err(|_| {
+        anyhow!(
+            "the XDP attach is not a bpf link, and is now nobody's:              `ip link set dev <iface> xdp off` lifts it"
+        )
+    })?;
+    pins.pin_link(link, name)
+}
+
+/** Give the XDP link pinned at `pin` the program `prog` (already loaded):
+    `bpf_link_update`, so the interface is never without a program. The
+    link stays pinned, and stays attached when `prog` is dropped. An error
+    other than [`LinkSwap::Defunct`] leaves the old program running.
+*/
+pub fn swap_xdp_link(prog: &mut Xdp, pin: &Path) -> Result<LinkSwap> {
+    let link = XdpLink::try_from(open_pinned_link(pin)?)
+        .with_context(|| format!("{} is not an XDP link", pin.display()))?;
+    match prog.attach_to_link(link) {
+        Ok(_) => Ok(LinkSwap::Swapped),
+        Err(err) if is_defunct(&err) => Ok(LinkSwap::Defunct),
+        Err(err) => Err(err)
+            .with_context(|| format!("replacing the program of the XDP link {}", pin.display())),
+    }
+}
+
 /** A TC program's attachment to one interface and direction, and whether
     the clsact qdisc it needed is its own.
 
@@ -95,17 +182,24 @@ fn xdp_mode_of(dump: &str) -> XdpAttach {
     someone else's. `release_qdisc` removes it again once the program is
     off it, and `Drop` does so silently as a backstop. Removal goes
     through iproute2's `tc`: aya adds a clsact but has no delete.
+
+    A TCX attach can be made to outlive the process: [`pin`](Self::pin)
+    after `attach`, and [`adopt`](Self::adopt) in the next one. A pinned
+    hook is attached for as long as its pin exists, so dropping the hook
+    or its program leaves it running; `detach` removes the pin as well.
 */
 pub struct TcHook {
     iface: String,
     direction: TcAttachType,
     link: Option<SchedClassifierLinkId>,
     added_clsact: bool,
+    /// The pin that keeps the link, once pinned or adopted.
+    pinned: Option<PathBuf>,
 }
 
 impl TcHook {
     pub fn new(iface: &str, direction: TcAttachType) -> Self {
-        Self { iface: iface.to_string(), direction, link: None, added_clsact: false }
+        Self { iface: iface.to_string(), direction, link: None, added_clsact: false, pinned: None }
     }
 
     pub fn iface(&self) -> &str {
@@ -113,14 +207,19 @@ impl TcHook {
     }
 
     pub fn attached(&self) -> bool {
-        self.link.is_some()
+        self.link.is_some() || self.pinned.is_some()
+    }
+
+    /// True when a pin keeps the attachment ([`pin`](Self::pin), [`adopt`](Self::adopt)).
+    pub fn pinned(&self) -> bool {
+        self.pinned.is_some()
     }
 
     /** Attach `prog` (already loaded). The link lives until `detach`, or
         until the program is dropped with its `Ebpf`.
     */
     pub fn attach(&mut self, prog: &mut SchedClassifier) -> Result<()> {
-        if self.link.is_some() {
+        if self.attached() {
             bail!("TC program already attached on {}", self.iface);
         }
         let link = match prog.attach(&self.iface, self.direction) {
@@ -136,16 +235,72 @@ impl TcHook {
         Ok(())
     }
 
+    /** Take the link `attach` made out of `prog` and pin it as `<name>`,
+        so the hook stays attached when `prog` is dropped. Ok(false), with
+        nothing changed, when the attach went through netlink: there is no
+        link to pin, and the hook ends with its program as before. When the
+        pin itself fails the link is gone, and the hook detached.
+    */
+    pub fn pin(&mut self, prog: &mut SchedClassifier, pins: &PinTxn, name: &str) -> Result<bool> {
+        let Some(id) = self.link.take_if(|id| !is_netlink(id)) else {
+            if self.link.is_some() {
+                return Ok(false);
+            }
+            bail!("no TC attach on {} to pin", self.iface);
+        };
+        let link = prog.take_link(id).context("taking the TC link from its program")?;
+        let link = FdLink::try_from(link).map_err(|_| {
+            anyhow!("the TC attach on {} is not a bpf link, and is now nobody's", self.iface)
+        })?;
+        self.pinned = Some(pins.pin_link(link, name)?);
+        Ok(true)
+    }
+
+    /** Take over the hook an earlier process pinned at `pin`, giving its
+        link the program `prog` (already loaded) in one step. On
+        [`LinkSwap::Swapped`] the hook is attached and pinned, as after
+        `attach` and `pin`. On [`LinkSwap::Defunct`], and on an error,
+        nothing changed and this hook is not attached.
+    */
+    pub fn adopt(&mut self, prog: &mut SchedClassifier, pin: &Path) -> Result<LinkSwap> {
+        if self.attached() {
+            bail!("TC program already attached on {}", self.iface);
+        }
+        let link = SchedClassifierLink::try_from(open_pinned_link(pin)?)
+            .with_context(|| format!("{} is not a TC link", pin.display()))?;
+        match prog.attach_to_link(link) {
+            Ok(id) => {
+                self.link = Some(id);
+                self.pinned = Some(pin.to_path_buf());
+                Ok(LinkSwap::Swapped)
+            }
+            Err(err) if is_defunct(&err) => Ok(LinkSwap::Defunct),
+            Err(err) => Err(err).with_context(|| {
+                format!("replacing the program of the TC link {}", pin.display())
+            }),
+        }
+    }
+
     /** Detach `prog`; Ok when it was not attached. aya forgets the link
         either way, so after an error the kernel keeps running the program
-        until it is unloaded. Call [`release_qdisc`](Self::release_qdisc)
+        until it is unloaded. A pinned hook loses its pin too, which is
+        what detaches it. Call [`release_qdisc`](Self::release_qdisc)
         after this.
     */
     pub fn detach(&mut self, prog: &mut SchedClassifier) -> Result<()> {
-        let Some(link) = self.link.take() else {
-            return Ok(());
+        let unpinned = match self.pinned.take() {
+            Some(pin) => match fs::remove_file(&pin) {
+                Err(err) if err.kind() != ErrorKind::NotFound => {
+                    Err(err).with_context(|| format!("removing {}", pin.display()))
+                }
+                _ => Ok(()),
+            },
+            None => Ok(()),
         };
-        prog.detach(link).with_context(|| format!("detaching TC on {}", self.iface))
+        if let Some(link) = self.link.take() {
+            prog.detach(link).with_context(|| format!("detaching TC on {}", self.iface))?;
+        }
+        unpinned
     }
 
     /** Remove the clsact qdisc `attach` added, taking any filter still on

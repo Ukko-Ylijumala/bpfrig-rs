@@ -9,7 +9,7 @@ bpfrig fills the gaps around it.
 
 | Crate | Side | What it gives a tool |
 |---|---|---|
-| `bpfrig` | userspace | `btf::Layouts` offsets, `ObjectLoader`, `pins::PinDir` / `PinTxn`, `probes::attach_kprobes`, `lsm::*`, `maps::open_pinned` / `map_in_use` / `Counters`, `batch::*`, `progs::*`, `host::*`; with the `net` feature, `net::*` (interface facts, XDP mode check, `TcHook`) |
+| `bpfrig` | userspace | `btf::Layouts` offsets, `ObjectLoader`, `pins::PinDir` / `PinTxn`, `probes::attach_kprobes`, `lsm::*`, `maps::open_pinned` / `map_in_use` / `MapLayout` / `Counters`, `batch::*`, `progs::*`, `host::*`; with the `net` feature, `net::*` (interface facts, XDP mode check, `TcHook`, pinning and swapping an XDP link) |
 | `bpfrig-ebpf` | BPF, `no_std` | `read_at` / `deref_at`, `bump`, atomic increments, `prev_verdict`, `consts`, `program!()` |
 | `bpfrig-build` | `build.rs` | `build_ebpf("<pkg>")` over aya-build, with rebuild tracking and `SKIP_EBPF_BUILD` |
 

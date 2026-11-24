@@ -1,17 +1,19 @@
 // Copyright (c) 2026 Mikko Tanner. All rights reserved.
 
 /*! Pinned maps: pinning them at load, opening them from a later
-    invocation, telling a live pin from a stale one, and the per-CPU
-    counter array every tool keeps.
+    invocation, telling a live pin from a stale one, checking a pin's
+    layout before a new load reuses it, and the per-CPU counter array
+    every tool keeps.
 */
 
 use std::fmt::Display;
 use std::marker::PhantomData;
+use std::mem::size_of;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use aya::Ebpf;
-use aya::maps::{Map, MapData, MapError, PerCpuArray};
+use aya::maps::{Map, MapData, MapError, MapInfo, MapType, PerCpuArray};
 use aya::programs::{ProgramError, loaded_programs};
 use nix::errno::Errno;
 
@@ -81,6 +83,69 @@ pub fn map_in_use(map: &MapData) -> Option<bool> {
     Some(false)
 }
 
+/** What a program compiled against a map relies on: the four facts a
+    pinned map has to share with this binary's definition before a new
+    load may reuse it ([`crate::ObjectLoader::reuse_pinned`]). Neither the
+    kernel nor aya compares them: a program loads against whatever map its
+    fd names, and then reads values of another size or shape.
+*/
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MapLayout {
+    pub map_type: MapType,
+    pub key_size: u32,
+    pub value_size: u32,
+    pub max_entries: u32,
+}
+
+impl MapLayout {
+    /** The layout this binary expects, from its key and value types. An
+        array's key is `u32`; an LPM trie's is aya's `lpm_trie::Key<K>`.
+        A per-CPU map's value is one CPU's.
+    */
+    pub const fn of<K, V>(map_type: MapType, max_entries: u32) -> Self {
+        Self {
+            map_type,
+            key_size: size_of::<K>() as u32,
+            value_size: size_of::<V>() as u32,
+            max_entries,
+        }
+    }
+
+    /// The layout the kernel reports for the map pinned at `path`.
+    pub fn of_pin(path: &Path) -> Result<Self> {
+        let shown = path.display();
+        let info = MapInfo::from_pin(path).with_context(|| format!("opening {shown}"))?;
+        let map_type = info.map_type().with_context(|| format!("{shown}: unknown map type"))?;
+        Ok(Self {
+            map_type,
+            key_size: info.key_size(),
+            value_size: info.value_size(),
+            max_entries: info.max_entries(),
+        })
+    }
+
+    /** How `found` (a pinned map) differs from `self` (what this binary
+        expects), as text for a log line; None when a load can reuse it.
+    */
+    pub fn mismatch(&self, found: &Self) -> Option<String> {
+        let mut diffs = Vec::new();
+        if self.map_type != found.map_type {
+            diffs.push(format!("type {:?}, expected {:?}", found.map_type, self.map_type));
+        }
+        let sizes = [
+            ("key size", found.key_size, self.key_size),
+            ("value size", found.value_size, self.value_size),
+            ("max entries", found.max_entries, self.max_entries),
+        ];
+        for (what, found, expected) in sizes {
+            if found != expected {
+                diffs.push(format!("{what} {found}, expected {expected}"));
+            }
+        }
+        (!diffs.is_empty()).then(|| diffs.join("; "))
+    }
+}
+
 /** Pin maps of the loaded object, as `(map name, pin name)` pairs. The
     links already keep the programs and their maps alive; these pins exist
     so a later invocation can read the maps back.
@@ -128,5 +193,38 @@ impl<S: Copy + Display + Into<u32>> Counters<S> {
         let result = trigger();
         let after = self.get(slot)?;
         Ok((after.saturating_sub(before), result))
+    }
+}
+
+/* ===== tests ===== */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every field that differs is named, with both values; an equal
+    /// layout is no mismatch.
+    #[test]
+    fn layout_mismatch_names_each_difference() {
+        let expected = MapLayout::of::<[u8; 12], [u8; 24]>(MapType::Hash, 16384);
+        assert_eq!(
+            expected,
+            MapLayout { map_type: MapType::Hash, key_size: 12, value_size: 24, max_entries: 16384 }
+        );
+        assert_eq!(expected.mismatch(&expected), None);
+
+        let resized = MapLayout { max_entries: 64, ..expected };
+        assert_eq!(expected.mismatch(&resized).unwrap(), "max entries 64, expected 16384");
+
+        let other = MapLayout::of::<[u8; 8], [u8; 32]>(MapType::LruHash, 16384);
+        assert_eq!(
+            expected.mismatch(&other).unwrap(),
+            "type LruHash, expected Hash; key size 8, expected 12; value size 32, expected 24"
+        );
+    }
+
+    #[test]
+    fn layout_of_a_missing_pin_is_an_error() {
+        assert!(MapLayout::of_pin(Path::new("/nonexistent/bpfrig/policy")).is_err());
     }
 }

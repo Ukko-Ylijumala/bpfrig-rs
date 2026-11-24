@@ -148,6 +148,12 @@ let ebpf = ObjectLoader::new(bpfrig::embed!("floodprog"))
   `env!` expands in the calling crate, so it sees the tool's `OUT_DIR`.
 - `max_entries(map, n)` passes through to `EbpfLoader::map_max_entries`.
   aya 0.14 deprecates the old `set_max_entries`.
+- `reuse_pinned(map, path)` makes the object's map the one pinned at
+  `path` (`EbpfLoader::map_pin_path`): a new load of a tool then works on
+  the state of the one that is attached. aya opens the pin without
+  comparing it to the object, so the caller checks it first
+  (`maps::MapLayout`). A missing pin fails the load: aya alone would
+  create the map and pin it there, behind the pin transaction's back.
 
 ### pins: bpffs and pin-directory bookkeeping
 
@@ -174,7 +180,14 @@ impl PinDir {
     pub fn files(&self) -> Vec<String>;
     pub fn remove_all(&self) -> Result<()>;
     pub fn claim(&self) -> Result<PinTxn<'_>>;
+    pub fn contents(&self) -> Contents;               // what a start finds
+    pub fn adopt(&self) -> Result<PinTxn<'_>>;        // work in it as it stands
+    pub fn remove(&self, name: &str) -> Result<bool>;
+    pub fn replace_with<E>(&self, name: &str, pin: impl FnOnce(&Path) -> Result<(), E>)
+        -> Result<PathBuf>;                           // rename over the old pin
 }
+
+pub enum Contents { Nothing, StaleMaps, LiveMaps, Links }
 
 /// Removes the pins made through it on drop unless committed, and the
 /// directory once empty. Derefs to the PinDir.
@@ -220,6 +233,18 @@ impl PinTxn<'_> {
   the transaction for the whole of `run` and never commits it, so its pins
   are removed on any exit, including a panic unwind. That is what
   `PinGuard` does now.
+- A tool whose attachment outlives its process (flood's persistent
+  datapath) commits, and its next start finds the directory live.
+  `contents` tells that start which case it is in: nothing there, maps no
+  loaded program uses (a killed run), maps a running instance uses, or
+  something that is not a map (a pinned link: attached, whoever is
+  running). `adopt` then gives a transaction on the directory as it
+  stands. It tracks only what it adds, so a take-over that fails removes
+  its own pins and leaves what was attached.
+- `replace_with` pins the new object under `<name>_new` and renames it
+  over `<name>`, so the path never stops naming an object (`rename()` over
+  an existing pin works in bpffs; shown on 6.8). It is not undone by an
+  uncommitted transaction: the old pin cannot be brought back.
 
 ### probes: kprobe tables
 
@@ -323,6 +348,15 @@ where
 pub fn open_pinned_data(path: &Path) -> Result<MapData>;
 pub fn pin_maps(ebpf: &mut Ebpf, maps: &[(&str, &str)], pins: &PinTxn) -> Result<()>;
 pub fn map_in_use(map: &MapData) -> Option<bool>;
+
+/// Type, key size, value size and max entries: what a reused pin must share.
+pub struct MapLayout { .. }
+
+impl MapLayout {
+    pub const fn of<K, V>(map_type: MapType, max_entries: u32) -> Self;
+    pub fn of_pin(path: &Path) -> Result<Self>;
+    pub fn mismatch(&self, found: &Self) -> Option<String>;   // None: reusable
+}
 
 /// A per-CPU u64 array indexed by a slot enum.
 pub struct Counters<S> { .. }
@@ -472,7 +506,16 @@ impl TcHook {
     pub fn attach(&mut self, prog: &mut SchedClassifier) -> Result<()>;
     pub fn detach(&mut self, prog: &mut SchedClassifier) -> Result<()>;
     pub fn release_qdisc(&mut self) -> Result<bool>;
+    pub fn pinned(&self) -> bool;
+    pub fn pin(&mut self, prog: &mut SchedClassifier, pins: &PinTxn, name: &str)
+        -> Result<bool>;                              // false: a netlink attach
+    pub fn adopt(&mut self, prog: &mut SchedClassifier, pin: &Path) -> Result<LinkSwap>;
 }
+
+pub enum LinkSwap { Swapped, Defunct }
+pub fn pin_xdp_link(prog: &mut Xdp, id: XdpLinkId, pins: &PinTxn, name: &str)
+    -> Result<PathBuf>;
+pub fn swap_xdp_link(prog: &mut Xdp, pin: &Path) -> Result<LinkSwap>;
 ```
 
 - `verify_xdp_mode` reports the mode the kernel actually used, from the
@@ -489,6 +532,28 @@ impl TcHook {
   netlink attach succeeded, so a failed fallback left the clsact behind.
   The hook records it as soon as it is added, and flood now releases it
   when the attach fails.
+
+- An attachment that outlives its process is a pinned link.
+  `pin_xdp_link` takes the link of a fresh attach out of its program and
+  pins it through the transaction; from then on dropping the `Ebpf`
+  detaches nothing, and removing the pin does. `swap_xdp_link` gives a
+  pinned link the program of a new load (`bpf_link_update`): the kernel
+  replaces it in one step, so a restart or an upgrade never leaves the
+  interface without a program. `TcHook::pin` and `TcHook::adopt` are the
+  same two steps for a TCX link; a pinned hook's `detach` removes the pin.
+- A link whose interface was deleted is attached to nothing and never
+  attaches again, also when an interface of the same name comes back. The
+  kernel answers `bpf_link_update` with ENOLINK, which is reported as
+  `LinkSwap::Defunct` and not as an error: the caller removes the pin and
+  attaches fresh.
+- A netlink attach has no link to pin. aya gives no accessor for the kind
+  of an attach, and its `FdLink::try_from` drops a netlink link without
+  detaching it, which would leave the program on the interface with no
+  owner. So the kind is read from the link id's `Debug` before the link
+  leaves its program: `pin_xdp_link` then fails with the attach still its
+  program's, and `TcHook::pin` returns false (flood lets the TC fallback
+  run unpinned on kernels before 6.6, and refuses a netlink XDP attach
+  for a persistent start).
 
 A note for the BPF side of any TCX program: under TCX, a return of 0 is
 `TCX_PASS`, which ends the hook chain and skips later programs and

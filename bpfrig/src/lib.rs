@@ -10,18 +10,20 @@
     - [`ObjectLoader`]: load an embedded object with patched globals and
       map sizes.
     - [`pins`]: bpffs, the per-tool pin directory, and a pin transaction
-      that removes everything unless committed.
+      that removes everything unless committed, also over a directory
+      that is already live.
     - [`probes`]: kprobe tables and their attach loop.
     - [`lsm`]: the `bpf` LSM gate, LSM attach, and the boot persistence
       check.
     - [`maps`]: pinned maps opened by their kernel type, the stale-pin
-      test, and per-CPU counters.
+      test, the layout check for a reused pin, and per-CPU counters.
     - [`batch`]: `BPF_MAP_*_BATCH` reads, drains, updates and deletes.
     - [`progs`]: the root gate and the live-program listing.
     - [`host`]: small kernel facts (the monotonic clock, the running
       kernel's config).
-    - `net` (feature `net`): interface facts, the XDP mode check, and a
-      TC hook that cleans up the clsact qdisc it added.
+    - `net` (feature `net`): interface facts, the XDP mode check, a TC
+      hook that cleans up the clsact qdisc it added, and XDP and TC links
+      pinned so the attachment outlives the process.
 
     `aya` is re-exported so the macros here can name it, and so a tool's
     `aya` and this crate's are always the same version.
