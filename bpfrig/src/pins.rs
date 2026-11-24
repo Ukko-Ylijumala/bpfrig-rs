@@ -28,10 +28,14 @@
 
 use std::cell::RefCell;
 use std::error::Error as StdError;
+use std::ffi::CString;
 use std::fmt;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
+use std::mem::size_of;
 use std::ops::Deref;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -49,6 +53,66 @@ pub const BPFFS: &str = "/sys/fs/bpf";
 pub const LINK_PREFIX: &str = "link_";
 /// Suffix of the scratch pin [`PinDir::replace_with`] renames into place.
 const REPLACE_SUFFIX: &str = "_new";
+/// `bpf(2)` command: open the object pinned at a path.
+const BPF_OBJ_GET: libc::c_long = 7;
+
+/// What a bpffs pin holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinKind {
+    Map,
+    Link,
+    Program,
+    /// Something else the kernel pins (BTF), or a newer kind.
+    Other,
+}
+
+/// `union bpf_attr` as `BPF_OBJ_GET` reads it.
+#[repr(C)]
+struct ObjGetAttr {
+    pathname: u64,
+    bpf_fd: u32,
+    file_flags: u32,
+}
+
+/** What is pinned at `path`. The kind is not something the object's info
+    tells: `BPF_OBJ_GET_INFO_BY_FD` answers for any bpf object and fills
+    whichever struct belongs to it, so a pinned link opened "as a map"
+    (`MapData::from_pin`) succeeds, with the link's type and id read as a
+    map's. The kernel does say what an fd is in its fdinfo, where a map has
+    a `map_type:` line, a link `link_type:` and a program `prog_type:`.
+*/
+pub fn pin_kind(path: &Path) -> Result<PinKind> {
+    let shown = path.display();
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("{shown}: a NUL in the path"))?;
+    let mut attr = ObjGetAttr { pathname: c_path.as_ptr() as u64, bpf_fd: 0, file_flags: 0 };
+    /* Safety: `attr` is a valid, fully initialised BPF_OBJ_GET argument of
+       the size passed, and `c_path` outlives the call. */
+    let fd = unsafe {
+        libc::syscall(libc::SYS_bpf, BPF_OBJ_GET, &raw mut attr, size_of::<ObjGetAttr>())
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error()).with_context(|| format!("opening {shown}"));
+    }
+    /* Safety: a fresh fd the kernel just returned, owned by nothing else. */
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))
+        .with_context(|| format!("reading the fdinfo of {shown}"))?;
+    Ok(kind_in_fdinfo(&info))
+}
+
+/// The kind an fdinfo dump names.
+fn kind_in_fdinfo(info: &str) -> PinKind {
+    for line in info.lines() {
+        match line.split(':').next() {
+            Some("map_type") => return PinKind::Map,
+            Some("link_type") => return PinKind::Link,
+            Some("prog_type") => return PinKind::Program,
+            _ => {}
+        }
+    }
+    PinKind::Other
+}
 
 /** Make sure a bpffs is mounted at /sys/fs/bpf, mounting one if missing,
     so that pins have somewhere to live.
@@ -217,13 +281,17 @@ impl PinDir {
 
     /** What the directory holds, for a start that has to choose between a
         fresh load, clearing a dead run's pins, taking over an attachment
-        and refusing. A pin that does not open as a map counts as a link:
-        so does one this process may not open at all.
+        and refusing. A pin that is not a map ([`pin_kind`]) counts as a
+        link: so does one this process may not open at all.
     */
     pub fn contents(&self) -> Contents {
         let mut found = Contents::Nothing;
         for name in self.files() {
-            match MapData::from_pin(self.dir.join(&name)) {
+            let path = self.dir.join(&name);
+            if !matches!(pin_kind(&path), Ok(PinKind::Map)) {
+                return Contents::Links;
+            }
+            match MapData::from_pin(&path) {
                 Err(_) => return Contents::Links,
                 Ok(data) if map_in_use(&data) == Some(true) => found = Contents::LiveMaps,
                 Ok(_) if found == Contents::Nothing => found = Contents::StaleMaps,
@@ -290,12 +358,18 @@ impl PinDir {
     fn refuse_live(&self) -> Result<()> {
         for name in self.files() {
             let path = self.dir.join(&name);
-            let data = MapData::from_pin(&path).with_context(|| {
+            let not_a_map = || {
                 format!(
                     "{} is not a pinned map, so it may be live (remove it by hand if not)",
                     path.display()
                 )
-            })?;
+            };
+            /* By its kind, not by whether it opens as a map: a link does. */
+            match pin_kind(&path).with_context(not_a_map)? {
+                PinKind::Map => {}
+                kind => bail!("{} (a pinned {kind:?})", not_a_map()),
+            }
+            let data = MapData::from_pin(&path).with_context(not_a_map)?;
             if map_in_use(&data) == Some(true) {
                 bail!(
                     "{self} belongs to a running instance: a loaded program still uses \
@@ -535,6 +609,20 @@ mod tests {
 
         pins.remove_all().unwrap();
         let _ = fs::remove_dir(&root);
+    }
+
+    /// The kind comes from the fdinfo line only that kind of object has.
+    #[test]
+    fn pin_kind_is_read_from_fdinfo() {
+        let head = "pos:\t0\nflags:\t02000002\nmnt_id:\t16\nino:\t1057\n";
+        let kind = |rest: &str| kind_in_fdinfo(&format!("{head}{rest}"));
+        assert_eq!(kind("map_type:\t1\nkey_size:\t12\nvalue_size:\t16\n"), PinKind::Map);
+        /* An XDP link: its type number (6) is also a valid map type, which
+           is why the object's info cannot tell the two apart. */
+        assert_eq!(kind("link_type:\txdp\nlink_id:\t44\nprog_id:\t9368\n"), PinKind::Link);
+        assert_eq!(kind("prog_type:\t6\nprog_jited:\t1\n"), PinKind::Program);
+        assert_eq!(kind(""), PinKind::Other);
+        assert!(pin_kind(Path::new("/nonexistent/bpfrig/pin")).is_err());
     }
 
     /// Without a bpffs only two answers can be shown: nothing there, and

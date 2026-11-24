@@ -189,6 +189,9 @@ impl PinDir {
 
 pub enum Contents { Nothing, StaleMaps, LiveMaps, Links }
 
+pub enum PinKind { Map, Link, Program, Other }
+pub fn pin_kind(path: &Path) -> Result<PinKind>;
+
 /// Removes the pins made through it on drop unless committed, and the
 /// directory once empty. Derefs to the PinDir.
 pub struct PinTxn<'a> { .. }
@@ -241,6 +244,15 @@ impl PinTxn<'_> {
   running). `adopt` then gives a transaction on the directory as it
   stands. It tracks only what it adds, so a take-over that fails removes
   its own pins and leaves what was attached.
+- What a pin holds is read from the fdinfo of the opened object
+  (`pin_kind`: a `map_type:`, `link_type:` or `prog_type:` line), never
+  from whether it opens as a map. `BPF_OBJ_GET_INFO_BY_FD` answers for any
+  bpf object and fills whichever struct belongs to it, so
+  `MapData::from_pin` on a pinned XDP link succeeds, with the link's type
+  (6, also a valid map type) and id read as a map's. Until v0.1.5
+  `contents` and the stale-pin test of `claim_with` both took "opens as a
+  map" for "is a map": a directory with a pinned link read as live maps,
+  and a lone link pin could have been cleared as a stale map.
 - `replace_with` pins the new object under `<name>_new` and renames it
   over `<name>`, so the path never stops naming an object (`rename()` over
   an existing pin works in bpffs; shown on 6.8). It is not undone by an
