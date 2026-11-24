@@ -149,7 +149,8 @@ pub fn pin_xdp_link(prog: &mut Xdp, id: XdpLinkId, pins: &PinTxn, name: &str) ->
     let link = prog.take_link(id).context("taking the XDP link from its program")?;
     let link = FdLink::try_from(link).map_err(|_| {
         anyhow!(
-            "the XDP attach is not a bpf link, and is now nobody's:              `ip link set dev <iface> xdp off` lifts it"
+            "the XDP attach is not a bpf link, and is now nobody's: \
+             `ip link set dev <iface> xdp off` lifts it"
         )
     })?;
     pins.pin_link(link, name)
